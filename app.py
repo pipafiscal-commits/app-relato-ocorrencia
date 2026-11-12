@@ -126,8 +126,7 @@ def usar_google_sheets():
     try:
         backend = st.secrets["storage"]["backend"]
     except (StreamlitSecretNotFoundError, KeyError):
-        st.error("Configure storage.backend nas secrets do Streamlit.")
-        st.stop()
+        return False
 
     if backend not in {"local", "google_sheets"}:
         st.error("storage.backend deve ser 'local' ou 'google_sheets'.")
@@ -151,6 +150,18 @@ def buscar_dados_online():
 
 
 def carregar_dados():
+    if not usar_google_sheets():
+        if BASE_PRESTADORES_PATH.exists():
+            try:
+                df = filtrar_colunas_base(
+                    pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna("")
+                )
+                if not df.empty:
+                    return df, "Offline (base local)"
+            except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro:
+                st.error(f"Não foi possível carregar a cópia local da planilha: {erro}")
+        return pd.DataFrame(columns=COLUNAS_BASE), "Offline (sem cópia local da base)"
+
     try:
         df = buscar_dados_online()
     except (OSError, ValueError, pd.errors.ParserError) as erro_online:
@@ -195,8 +206,11 @@ with st.sidebar:
         st.warning("Não foi possível detectar o endereço da rede local.")
 
     st.header("Base de dados")
-    st.caption("Atualize a planilha quando houver internet. A cópia salva será usada automaticamente quando estiver offline.")
-    if st.button("Atualizar base da planilha"):
+    st.caption(
+        "Para trabalhar sem Google Sheets, defina storage.backend como 'local' "
+        "nas secrets. A base e os relatos serão guardados em arquivos CSV neste servidor."
+    )
+    if usar_google_sheets() and st.button("Atualizar base da planilha"):
         buscar_dados_online.clear()
         try:
             df_atualizado = buscar_dados_online()
@@ -219,25 +233,65 @@ with st.sidebar:
         disabled=df_dados.empty,
         use_container_width=True,
     )
+    arquivo_base_local = st.file_uploader(
+        "Importar CSV da base para uso offline",
+        type=["csv"],
+        key="arquivo_base_local",
+    )
+    if st.button("Salvar CSV como base offline"):
+        if arquivo_base_local is None:
+            st.error("Selecione primeiro o arquivo base_prestadores.csv.")
+        else:
+            try:
+                df_local = filtrar_colunas_base(
+                    pd.read_csv(arquivo_base_local, dtype=str).fillna("")
+                )
+                if df_local.empty:
+                    raise ValueError("O arquivo CSV não contém registros.")
+                df_local.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro:
+                st.error(f"Não foi possível salvar a base offline: {erro}")
+            else:
+                st.session_state.dados_planilha = df_local
+                st.session_state.status_base = "Offline (base local importada)"
+                st.success("Base CSV salva para uso offline.")
+                st.rerun()
 
 def carregar_historico():
     if usar_google_sheets():
         try:
             linhas = obter_aba_relatorios().get_all_values()
-            return [
+            historico = [
                 dict(zip(COLUNAS_HISTORICO, linha))
                 for linha in linhas[1:]
                 if linha
             ]
+            ids_remotos = {item.get("id") for item in historico}
+            historico.extend(
+                item
+                for item in carregar_historico_local()
+                if item.get("id") and item.get("id") not in ids_remotos
+            )
+            try:
+                salvar_historico_local(historico)
+            except OSError as erro:
+                st.warning(f"Não foi possível atualizar a cópia local dos relatos: {erro}")
+            return historico
         except (
             ValueError,
             gspread.exceptions.GSpreadException,
             requests.exceptions.RequestException,
             GoogleAuthError,
         ) as erro:
-            st.error(f"Não foi possível carregar os relatos da planilha: {erro}")
-            return []
+            st.warning(
+                "Não foi possível acessar os relatos no Google Sheets. "
+                f"Usando o histórico local: {erro}"
+            )
 
+    return carregar_historico_local()
+
+
+def carregar_historico_local():
     if not DADOS_LOCAIS_PATH.exists():
         return []
     try:
@@ -247,14 +301,25 @@ def carregar_historico():
         return []
 
 
+def salvar_historico_local(historico):
+    pd.DataFrame(historico, columns=COLUNAS_HISTORICO).to_csv(
+        DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
+    )
+
+
 @st.cache_resource
 def obter_aba_relatorios():
     try:
         configuracao_storage = st.secrets["storage"]
-        service_account = st.secrets["gcp_service_account"]
+        service_account = dict(st.secrets["gcp_service_account"])
         spreadsheet_id = configuracao_storage["spreadsheet_id"]
         worksheet_title = configuracao_storage.get("worksheet", "Registro")
-        client = gspread.service_account_from_dict(dict(service_account))
+        chave_privada = service_account.get("private_key")
+        if isinstance(chave_privada, str):
+            service_account["private_key"] = (
+                chave_privada.replace("\\n", "\n").replace("\r\n", "\n").strip()
+            )
+        client = gspread.service_account_from_dict(service_account)
         worksheet = client.open_by_key(spreadsheet_id).worksheet(worksheet_title)
     except (StreamlitSecretNotFoundError, KeyError) as erro:
         raise ValueError(
@@ -269,6 +334,31 @@ def obter_aba_relatorios():
             f"A primeira linha da aba '{worksheet_title}' deve conter os cabeçalhos do app."
         )
     return worksheet
+
+
+def sincronizar_historico_local():
+    worksheet = obter_aba_relatorios()
+    historico_local = carregar_historico_local()
+    linhas_remotas = worksheet.get_all_values()
+    indice_id = COLUNAS_HISTORICO.index("id")
+    ids_remotos = {
+        linha[indice_id]
+        for linha in linhas_remotas[1:]
+        if len(linha) > indice_id and linha[indice_id]
+    }
+    pendentes = [
+        item for item in historico_local
+        if item.get("id") and item["id"] not in ids_remotos
+    ]
+    if pendentes:
+        worksheet.append_rows(
+            [
+                [item.get(coluna, "") for coluna in COLUNAS_HISTORICO]
+                for item in pendentes
+            ],
+            value_input_option="RAW",
+        )
+    return len(pendentes)
 
 
 # Inicialização do histórico de ocorrências
@@ -495,15 +585,42 @@ with aba_novo:
             }
             try:
                 if usar_google_sheets():
-                    obter_aba_relatorios().append_row(
-                        [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
-                        value_input_option="RAW",
-                    )
+                    try:
+                        obter_aba_relatorios().append_row(
+                            [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
+                            value_input_option="RAW",
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        gspread.exceptions.GSpreadException,
+                        requests.exceptions.RequestException,
+                        GoogleAuthError,
+                    ) as erro_online:
+                        historico_local = carregar_historico_local()
+                        historico_local.append(nova_oc)
+                        salvar_historico_local(historico_local)
+                        st.session_state.historico_ocorrencias.append(nova_oc)
+                        st.warning(
+                            "Google Sheets indisponível. Ocorrência salva neste dispositivo "
+                            f"para uso offline: {erro_online}"
+                        )
+                    else:
+                        historico_local = carregar_historico_local()
+                        if not any(item.get("id") == nova_oc["id"] for item in historico_local):
+                            historico_local.append(nova_oc)
+                            try:
+                                salvar_historico_local(historico_local)
+                            except OSError as erro_local:
+                                st.warning(f"Relato enviado ao Google Sheets, mas não foi possível salvar a cópia local: {erro_local}")
+                        st.session_state.historico_ocorrencias.append(nova_oc)
+                        st.success("Ocorrência salva no Google Sheets.")
                 else:
-                    historico_atualizado = st.session_state.historico_ocorrencias + [nova_oc]
-                    pd.DataFrame(historico_atualizado).to_csv(
-                        DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
-                    )
+                    historico_atualizado = carregar_historico_local()
+                    historico_atualizado.append(nova_oc)
+                    salvar_historico_local(historico_atualizado)
+                    st.session_state.historico_ocorrencias.append(nova_oc)
+                    st.success("Ocorrência salva localmente.")
             except (
                 OSError,
                 ValueError,
@@ -512,9 +629,6 @@ with aba_novo:
                 GoogleAuthError,
             ) as e:
                 st.error(f"Não foi possível salvar a ocorrência: {e}")
-            else:
-                st.session_state.historico_ocorrencias.append(nova_oc)
-                st.success("Ocorrência salva na base configurada.")
 
     with col_btn2:
         pdf_bytes = gerar_pdf()
@@ -528,6 +642,22 @@ with aba_novo:
 # Aba de Histórico e Consultas
 with aba_historico:
     st.subheader("Consultar Ocorrências Salvas")
+    if usar_google_sheets() and st.button("Sincronizar relatos salvos offline"):
+        try:
+            quantidade = sincronizar_historico_local()
+        except (
+            OSError,
+            ValueError,
+            gspread.exceptions.GSpreadException,
+            requests.exceptions.RequestException,
+            GoogleAuthError,
+        ) as erro:
+            st.error(f"Não foi possível sincronizar os relatos locais: {erro}")
+        else:
+            st.success(f"Sincronização concluída: {quantidade} relato(s) enviado(s).")
+            st.session_state.pop("historico_ocorrencias", None)
+            st.rerun()
+
     data_filtro = st.date_input("Filtrar por data:", date.today())
     
     if st.session_state.historico_ocorrencias:
