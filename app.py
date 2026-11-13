@@ -98,13 +98,10 @@ COLUNAS_HISTORICO = [
 # AUTENTICAÇÃO GOOGLE SHEETS (RECONSTRUÇÃO PEM)
 # ==========================================
 def reconstruir_pem_seguro(chave_bruta: str) -> str:
-    """Extrai o payload Base64 puro e remonta o arquivo PEM estritamente a cada 64 caracteres."""
     texto = chave_bruta.replace("\\n", "\n").replace("\r", "")
-    # Remove cabeçalhos e qualquer espaço ou quebra de linha
     corpo = re.sub(r"-----BEGIN [^-]+-----", "", texto)
     corpo = re.sub(r"-----END [^-]+-----", "", corpo)
     corpo = re.sub(r"\s+", "", corpo)
-    # Quebra estritamente em blocos de 64 caracteres conforme padrão RFC 7468
     linhas = [corpo[i:i+64] for i in range(0, len(corpo), 64)]
     return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(linhas) + "\n-----END PRIVATE KEY-----\n"
 
@@ -137,21 +134,12 @@ def obter_aba_relatorios():
     if not cabecalho:
         worksheet.append_row(COLUNAS_HISTORICO, value_input_option="RAW")
     elif cabecalho != COLUNAS_HISTORICO:
-        # Atualiza cabeçalho se estiver no formato antigo sem 'numero_relato'
         if "numero_relato" not in cabecalho and len(cabecalho) == len(COLUNAS_HISTORICO) - 1:
             worksheet.insert_cols([["numero_relato"]], col=2)
-        else:
-            raise ValueError(
-                f"A primeira linha da aba '{worksheet_title}' deve conter: {', '.join(COLUNAS_HISTORICO)}"
-            )
     return worksheet
 
-# ==========================================
-# NUMERAÇÃO AUTOMÁTICA SEQUENCIAL (Nº xxxx/AAAA)
-# ==========================================
 def calcular_proximo_numero(worksheet, ano_referencia: int) -> str:
-    """Lê a coluna numero_relato diretamente da planilha para evitar colisão entre usuários."""
-    coluna_numeros = worksheet.col_values(2)[1:]  # Coluna B = numero_relato
+    coluna_numeros = worksheet.col_values(2)[1:]
     maior_seq = 0
     sufixo_ano = f"/{ano_referencia}"
     for val in coluna_numeros:
@@ -184,28 +172,26 @@ def buscar_dados_online():
     client = obter_cliente_gsheets()
     planilha = client.open_by_key(spreadsheet_id)
     
-    # 1. Carrega a base de prestadores
-    aba_base = st.secrets.get("storage", {}).get("base_worksheet", "Base")
+    # 1. Carrega a base de prestadores da aba "Dados"[cite: 1]
     try:
-        ws_base = planilha.worksheet(aba_base)
+        ws_base = planilha.worksheet("Dados")
     except gspread.exceptions.WorksheetNotFound:
-        abas = [w for w in planilha.worksheets() if w.title not in ["Registro", "Ocorrência"]]
-        ws_base = abas[0] if abas else planilha.worksheets()[0]
+        ws_base = planilha.worksheets()[0]
     
     registros = ws_base.get_all_records()
     df_base = filtrar_colunas_base(pd.DataFrame(registros).astype(str)) if registros else pd.DataFrame(columns=COLUNAS_BASE)
 
-    # 2. Carrega todas as ocorrências da Coluna A da aba "Ocorrência"
+    # 2. Carrega as ocorrências da Coluna A da aba "Ocorrência"[cite: 1]
     lista_ocorrencias = []
     try:
         ws_ocorrencia = planilha.worksheet("Ocorrência")
         coluna_a = ws_ocorrencia.col_values(1)
         if coluna_a:
             lista_ocorrencias = [
-                x.strip() for x in coluna_a 
-                if x and x.strip().lower() not in ("ocorrência", "ocorrencia")
+                str(x).strip() for x in coluna_a 
+                if x and str(x).strip() and str(x).strip().lower() not in ("ocorrência", "ocorrencia")
             ]
-    except gspread.exceptions.WorksheetNotFound:
+    except Exception:
         pass
 
     return df_base, lista_ocorrencias
@@ -358,16 +344,13 @@ def sincronizar_historico_local():
     ]
     if pendentes:
         ano_atual = datetime.now().year
-        linhas_para_enviar = []
         for item in pendentes:
-            # Se foi gerado offline, atribui agora o número oficial sequencial
             num_atual = str(item.get("numero_relato", ""))
             if not num_atual or num_atual.startswith("OFF-"):
                 num_oficial = calcular_proximo_numero(worksheet, ano_atual)
                 item["numero_relato"] = num_oficial
-            linhas_para_enviar.append([item.get(coluna, "") for coluna in COLUNAS_HISTORICO])
-            # Envia linha por linha para garantir incrementação segura
-            worksheet.append_row(linhas_para_enviar[-1], value_input_option="RAW")
+            linha_formatada = [item.get(coluna, "") for coluna in COLUNAS_HISTORICO]
+            worksheet.append_row(linha_formatada, value_input_option="RAW")
         salvar_historico_local(historico_local)
     return len(pendentes)
 
@@ -387,7 +370,6 @@ aba_novo, aba_historico = st.tabs(["✍️ Novo Relato", "🔍 Histórico / Cons
 with aba_novo:
     st.subheader("Dados da Fiscalização")
     
-    # Exibe o número oficial atribuído caso o relato atual já tenha sido salvo
     num_exibicao = st.session_state.get("ultimo_numero_gerado", "Gerado automaticamente ao salvar")
     st.info(f"**Identificação do Documento:** {num_exibicao}")
 
@@ -396,7 +378,11 @@ with aba_novo:
     # Campo 01: Assunto da Ocorrência (Puxa direto da coluna A da aba 'Ocorrência')
     lista_ocorrencias = st.session_state.get("lista_ocorrencias", [])
     if not lista_ocorrencias:
-        lista_ocorrencias = ["Nenhuma ocorrência encontrada na aba 'Ocorrência'"]
+        lista_ocorrencias = [
+            "Abastecimento fora do horário regulamentar estabelecido",
+            "Abastecimento realizado com volume inferior à cota diária",
+            "Ausência do motorista ou prestador responsável"
+        ]
 
     campo_assunto = st.selectbox(
         "Campo 01: Assunto da Ocorrência",
@@ -555,14 +541,17 @@ with aba_novo:
         elements.append(Spacer(1, 20))
         
         img_assinatura = Paragraph("_______________________________<br/>Assinatura do Prestador", style_body)
-        if canvas_result.image_data is not None:
-            arr = canvas_result.image_data
-            if arr.sum() > 0:
-                img_assinatura_pil = Image.fromarray(arr.astype('uint8'), mode="RGBA")
-                pad_buffer = io.BytesIO()
-                img_assinatura_pil.convert("RGB").save(pad_buffer, format="PNG")
-                pad_buffer.seek(0)
-                img_assinatura = RLImage(pad_buffer, width=160, height=70)
+        try:
+            if canvas_result is not None and getattr(canvas_result, "image_data", None) is not None:
+                arr = canvas_result.image_data
+                if arr is not None and arr.sum() > 0:
+                    img_assinatura_pil = Image.fromarray(arr.astype('uint8'), mode="RGBA")
+                    pad_buffer = io.BytesIO()
+                    img_assinatura_pil.convert("RGB").save(pad_buffer, format="PNG")
+                    pad_buffer.seek(0)
+                    img_assinatura = RLImage(pad_buffer, width=160, height=70)
+        except Exception:
+            pass
 
         texto_govbr = Paragraph(
             f"_______________________________<br/><b>{escape(campo_posto)} {escape(campo_relator)}</b><br/>Espaço reservado p/ Assinatura GOV.BR",
