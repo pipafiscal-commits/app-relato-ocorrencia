@@ -1,7 +1,7 @@
 streamlit
 pandas
-Pillow
-reportlab
-qrcode[pil]
 gspread
+reportlab
+Pillow
 requests
+streamlit-drawable-canvas
