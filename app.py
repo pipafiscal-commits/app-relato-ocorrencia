@@ -76,7 +76,9 @@ exigir_autenticacao()
 # Caminhos locais e constantes
 DADOS_LOCAIS_PATH = Path(__file__).with_name("dados_local.csv")
 BASE_PRESTADORES_PATH = Path(__file__).with_name("base_prestadores.csv")
-COLUNAS_BASE = ["Placa", "Motorista", "Nr Contrato", "Município", "Lote", "Empresa", "Ocorrência"]
+OCORRENCIAS_LOCAIS_PATH = Path(__file__).with_name("ocorrencias_local.csv")
+
+COLUNAS_BASE = ["Placa", "Motorista", "Nr Contrato", "Município", "Lote", "Empresa"]
 COLUNAS_BASE_OBRIGATORIAS = COLUNAS_BASE[:-1]
 COLUNAS_HISTORICO = [
     "id",
@@ -166,70 +168,86 @@ def usar_google_sheets():
 
 @st.cache_data(ttl=600)
 def buscar_dados_online():
-    url_planilha = st.secrets.get("data", {}).get("sheet_url")
-    if url_planilha and "export?format=csv" in url_planilha:
-        with urlopen(url_planilha, timeout=15) as resposta:
-            conteudo = resposta.read()
-        df = filtrar_colunas_base(pd.read_csv(io.BytesIO(conteudo), dtype=str).fillna(""))
-    else:
-        configuracao_storage = st.secrets["storage"]
-        spreadsheet_id = configuracao_storage["spreadsheet_id"]
-        aba_base = configuracao_storage.get("base_worksheet", "Base")
-        client = obter_cliente_gsheets()
-        planilha = client.open_by_key(spreadsheet_id)
-        try:
-            ws = planilha.worksheet(aba_base)
-        except gspread.exceptions.WorksheetNotFound:
-            abas = [w for w in planilha.worksheets() if w.title != configuracao_storage.get("worksheet", "Registro")]
-            if not abas:
-                raise ValueError("Nenhuma aba de base de prestadores encontrada na planilha.")
-            ws = abas[0]
-        registros = ws.get_all_records()
-        df = filtrar_colunas_base(pd.DataFrame(registros).astype(str))
+    configuracao_storage = st.secrets["storage"]
+    spreadsheet_id = configuracao_storage["spreadsheet_id"]
+    client = obter_cliente_gsheets()
+    planilha = client.open_by_key(spreadsheet_id)
+    
+    # 1. Carrega a base de prestadores
+    aba_base = configuracao_storage.get("base_worksheet", "Base")
+    try:
+        ws_base = planilha.worksheet(aba_base)
+    except gspread.exceptions.WorksheetNotFound:
+        abas = [w for w in planilha.worksheets() if w.title not in ["Registro", "Ocorrência"]]
+        ws_base = abas[0] if abas else planilha.worksheets()[0]
+    
+    df_base = filtrar_colunas_base(pd.DataFrame(ws_base.get_all_records()).astype(str))
 
-    if df.empty:
-        raise ValueError("A base de prestadores não contém registros.")
-    return df
+    # 2. Carrega as ocorrências especificamente da coluna A da aba "Ocorrência"
+    lista_ocorrencias = []
+    try:
+        ws_ocorrencia = planilha.worksheet("Ocorrência")
+        # Pega todos os valores da Coluna A (coluna 1)
+        coluna_a = ws_ocorrencia.col_values(1)
+        # Remove cabeçalho (se houver, ex: ignorando a linha 1 se for título "Ocorrência") e limpa vazios
+        if coluna_a:
+            # Se a primeira linha for o título, podemos ignorá-la se desejado, ou manter. Vamos limpar vazios:
+            lista_ocorrencias = [x.strip() for x in coluna_a if x and x.strip().lower() != "ocorrência"]
+    except Exception:
+        pass
+
+    return df_base, lista_ocorrencias
 
 
 def carregar_dados():
     if not usar_google_sheets():
+        df_base = pd.DataFrame(columns=COLUNAS_BASE)
         if BASE_PRESTADORES_PATH.exists():
             try:
-                df = filtrar_colunas_base(
-                    pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna("")
-                )
-                if not df.empty:
-                    return df, "Offline (base local carregada)"
-            except Exception as erro:
-                st.error(f"Não foi possível carregar a cópia local da planilha: {erro}")
-        return pd.DataFrame(columns=COLUNAS_BASE), "Offline (sem cópia local — preenchimento manual liberado)"
+                df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
+            except Exception:
+                pass
+        
+        ocorrencias = []
+        if OCORRENCIAS_LOCAIS_PATH.exists():
+            try:
+                df_oc = pd.read_csv(OCORRENCIAS_LOCAIS_PATH, dtype=str)
+                ocorrencias = df_oc.iloc[:, 0].dropna().astype(str).tolist()
+            except Exception:
+                pass
+        return df_base, ocorrencias, "Offline (base local carregada)"
 
     try:
-        df = buscar_dados_online()
+        df_base, ocorrencias = buscar_dados_online()
     except Exception as erro_online:
+        df_base = pd.DataFrame(columns=COLUNAS_BASE)
         if BASE_PRESTADORES_PATH.exists():
             try:
-                df = filtrar_colunas_base(
-                    pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna("")
-                )
-                if not df.empty:
-                    return df, f"Offline (usando cópia local; falha online: {erro_online})"
-            except Exception as erro_local:
-                st.error(f"Não foi possível carregar a cópia local da planilha: {erro_local}")
-
-        return pd.DataFrame(columns=COLUNAS_BASE), f"Offline (sem base local; falha online: {erro_online})"
+                df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
+            except Exception:
+                pass
+        
+        ocorrencias = []
+        if OCORRENCIAS_LOCAIS_PATH.exists():
+            try:
+                df_oc = pd.read_csv(OCORRENCIAS_LOCAIS_PATH, dtype=str)
+                ocorrencias = df_oc.iloc[:, 0].dropna().astype(str).tolist()
+            except Exception:
+                pass
+        return df_base, ocorrencias, f"Offline (usando cópia local; falha online: {erro_online})"
 
     try:
-        df.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-    except OSError as erro:
-        st.error(f"Não foi possível salvar a cópia local da planilha: {erro}")
-    return df, "Online (Google Sheets; cópia local atualizada)"
+        df_base.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
+        pd.DataFrame({"Ocorrência": ocorrencias}).to_csv(OCORRENCIAS_LOCAIS_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+    return df_base, ocorrencias, "Online (Google Sheets; cópia local atualizada)"
 
 
 if "dados_planilha" not in st.session_state:
-    dados_iniciais, status_inicial = carregar_dados()
-    st.session_state.dados_planilha = dados_iniciais
+    df_b, oc_l, status_inicial = carregar_dados()
+    st.session_state.dados_planilha = df_b
+    st.session_state.lista_ocorrencias = oc_l
     st.session_state.status_base = status_inicial
 
 with st.sidebar:
@@ -241,8 +259,9 @@ with st.sidebar:
     )
     if modo_offline_manual != st.session_state.get("forcar_offline", False):
         st.session_state.forcar_offline = modo_offline_manual
-        dados_iniciais, status_inicial = carregar_dados()
-        st.session_state.dados_planilha = dados_iniciais
+        df_b, oc_l, status_inicial = carregar_dados()
+        st.session_state.dados_planilha = df_b
+        st.session_state.lista_ocorrencias = oc_l
         st.session_state.status_base = status_inicial
         st.rerun()
 
@@ -250,12 +269,14 @@ with st.sidebar:
     if usar_google_sheets() and st.button("Atualizar base da planilha"):
         buscar_dados_online.clear()
         try:
-            df_atualizado = buscar_dados_online()
+            df_atualizado, oc_atualizado = buscar_dados_online()
             df_atualizado.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
+            pd.DataFrame({"Ocorrência": oc_atualizado}).to_csv(OCORRENCIAS_LOCAIS_PATH, index=False, encoding="utf-8-sig")
         except Exception as erro:
             st.error(f"Não foi possível atualizar a base: {erro}")
         else:
             st.session_state.dados_planilha = df_atualizado
+            st.session_state.lista_ocorrencias = oc_atualizado
             st.session_state.status_base = "Online (Google Sheets; cópia local atualizada)"
             st.rerun()
 
@@ -360,18 +381,13 @@ with aba_novo:
     
     campo_data = st.date_input("Campo 00: Data da Ocorrência", datetime.now())
 
-    # Campo 01: Assunto da Ocorrência (Carrega TODOS os dados unicos da coluna 'Ocorrência' da base)
-    if "Ocorrência" in df_dados.columns:
-        lista_ocorrencias = df_dados["Ocorrência"].dropna().astype(str).str.strip()
-        lista_ocorrencias = sorted(list(set([x for x in lista_ocorrencias if x])))
-    else:
-        lista_ocorrencias = []
-
+    # Campo 01: Assunto da Ocorrência (Puxa direto da coluna A da aba 'Ocorrência')
+    lista_ocorrencias = st.session_state.get("lista_ocorrencias", [])
     if not lista_ocorrencias:
-        lista_ocorrencias = ["Nenhuma ocorrência encontrada na base"]
+        lista_ocorrencias = ["Nenhuma ocorrência encontrada na aba 'Ocorrência'"]
 
     campo_assunto = st.selectbox(
-        "Campo 01: Assunto da Ocorrência (Selecione na lista da planilha)",
+        "Campo 01: Assunto da Ocorrência (Selecionado da aba 'Ocorrência')",
         options=lista_ocorrencias
     )
 
@@ -527,12 +543,10 @@ with aba_novo:
 
         elements.append(Spacer(1, 20))
         
-        # Converte o desenho feito no canvas para imagem no PDF
         img_assinatura = Paragraph("_______________________________<br/>Assinatura do Prestador", style_body)
         if canvas_result.image_data is not None:
-            import numpy as np
             arr = canvas_result.image_data
-            if arr.sum() > 0: # Verifica se o usuário realmente desenhou algo
+            if arr.sum() > 0:
                 img_assinatura_pil = Image.fromarray(arr.astype('uint8'), mode="RGBA")
                 pad_buffer = io.BytesIO()
                 img_assinatura_pil.convert("RGB").save(pad_buffer, format="PNG")
