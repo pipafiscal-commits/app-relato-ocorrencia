@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape
 from urllib.request import urlopen
 from streamlit.errors import StreamlitSecretNotFoundError
 from google.auth.exceptions import GoogleAuthError
+from streamlit_drawable_canvas import st_canvas
 
 # Dependências para geração de PDF
 from reportlab.lib.pagesizes import A4
@@ -91,12 +92,6 @@ COLUNAS_HISTORICO = [
     "empresa",
     "status",
 ]
-OCORRENCIAS_PADRAO = [
-    "Abastecimento fora do horário permitido",
-    "Ausência do módulo rastreador/embarcado",
-    "Desvio de rota da carrada",
-    "Cobrança indevida de água ao morador",
-]
 
 # ==========================================
 # AUTENTICAÇÃO GOOGLE SHEETS (BLINDADA)
@@ -107,7 +102,6 @@ def obter_cliente_gsheets():
         service_account = dict(st.secrets["gcp_service_account"])
         chave_privada = service_account.get("private_key", "")
         if isinstance(chave_privada, str):
-            # Remove espaços de indentação em cada linha e normaliza quebras
             linhas_limpas = [
                 linha.strip() 
                 for linha in chave_privada.replace("\\n", "\n").replace("\r\n", "\n").split("\n") 
@@ -172,7 +166,6 @@ def usar_google_sheets():
 
 @st.cache_data(ttl=600)
 def buscar_dados_online():
-    # Tenta primeiro via URL pública CSV se configurada, senão lê via API (gspread)
     url_planilha = st.secrets.get("data", {}).get("sheet_url")
     if url_planilha and "export?format=csv" in url_planilha:
         with urlopen(url_planilha, timeout=15) as resposta:
@@ -187,7 +180,6 @@ def buscar_dados_online():
         try:
             ws = planilha.worksheet(aba_base)
         except gspread.exceptions.WorksheetNotFound:
-            # Se não houver aba 'Base', pega a primeira aba que não seja 'Registro'
             abas = [w for w in planilha.worksheets() if w.title != configuracao_storage.get("worksheet", "Registro")]
             if not abas:
                 raise ValueError("Nenhuma aba de base de prestadores encontrada na planilha.")
@@ -209,7 +201,7 @@ def carregar_dados():
                 )
                 if not df.empty:
                     return df, "Offline (base local carregada)"
-            except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro:
+            except Exception as erro:
                 st.error(f"Não foi possível carregar a cópia local da planilha: {erro}")
         return pd.DataFrame(columns=COLUNAS_BASE), "Offline (sem cópia local — preenchimento manual liberado)"
 
@@ -278,29 +270,6 @@ with st.sidebar:
         disabled=df_dados.empty,
         use_container_width=True,
     )
-    arquivo_base_local = st.file_uploader(
-        "Importar CSV da base para uso offline",
-        type=["csv"],
-        key="arquivo_base_local",
-    )
-    if st.button("Salvar CSV como base offline"):
-        if arquivo_base_local is None:
-            st.error("Selecione primeiro o arquivo base_prestadores.csv.")
-        else:
-            try:
-                df_local = filtrar_colunas_base(
-                    pd.read_csv(arquivo_base_local, dtype=str).fillna("")
-                )
-                if df_local.empty:
-                    raise ValueError("O arquivo CSV não contém registros.")
-                df_local.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-            except Exception as erro:
-                st.error(f"Não foi possível salvar a base offline: {erro}")
-            else:
-                st.session_state.dados_planilha = df_local
-                st.session_state.status_base = "Offline (base local importada)"
-                st.success("Base CSV salva para uso offline.")
-                st.rerun()
 
 
 def carregar_historico_local():
@@ -373,7 +342,6 @@ def sincronizar_historico_local():
     return len(pendentes)
 
 
-# Inicialização do histórico de ocorrências
 if "historico_ocorrencias" not in st.session_state:
     st.session_state.historico_ocorrencias = carregar_historico()
 
@@ -385,33 +353,31 @@ st.caption(f"Status da Base de Dados: **{status_conexao}**")
 if status_conexao.startswith("Offline"):
     st.info(status_conexao)
 
-# Navegação por Abas
 aba_novo, aba_historico = st.tabs(["✍️ Novo Relato", "🔍 Histórico / Consultas"])
 
 with aba_novo:
     st.subheader("Dados da Fiscalização")
     
-    # Campo 00: Data
     campo_data = st.date_input("Campo 00: Data da Ocorrência", datetime.now())
 
-    # Campo 01: Assunto da Ocorrência
-    ocorrencias_planilha = (
-        df_dados["Ocorrência"].dropna().astype(str).unique().tolist()
-        if "Ocorrência" in df_dados.columns
-        else []
-    )
-    lista_ocorrencias = list(dict.fromkeys(OCORRENCIAS_PADRAO + ocorrencias_planilha))
+    # Campo 01: Assunto da Ocorrência (Carrega TODOS os dados unicos da coluna 'Ocorrência' da base)
+    if "Ocorrência" in df_dados.columns:
+        lista_ocorrencias = df_dados["Ocorrência"].dropna().astype(str).str.strip()
+        lista_ocorrencias = sorted(list(set([x for x in lista_ocorrencias if x])))
+    else:
+        lista_ocorrencias = []
+
+    if not lista_ocorrencias:
+        lista_ocorrencias = ["Nenhuma ocorrência encontrada na base"]
+
     campo_assunto = st.selectbox(
-        "Campo 01: Assunto da Ocorrência (Selecione ou digite)",
-        options=["-- Digitar novo assunto --"] + lista_ocorrencias
+        "Campo 01: Assunto da Ocorrência (Selecione na lista da planilha)",
+        options=lista_ocorrencias
     )
-    if campo_assunto == "-- Digitar novo assunto --":
-        campo_assunto = st.text_input("Digite o assunto personalizado:")
 
     st.markdown("---")
     st.markdown("### Busca do Prestador (Ênfase na Placa)")
     
-    # Busca com Ênfase na Placa (permite digitar manualmente se estiver sem base offline)
     placas = df_dados["Placa"].dropna().astype(str).unique().tolist() if "Placa" in df_dados.columns else []
     if placas:
         opcoes_placa = ["", "-- Digitar placa manualmente --"] + placas
@@ -423,7 +389,6 @@ with aba_novo:
     else:
         placa_selecionada = st.text_input("Campo 02: Placa do Veículo (Ex: ABC1D23):").upper()
     
-    # Autofill dos dados baseados na Placa
     motorista_val, contrato_val, mun_val, lote_val, empresa_val = "", "", "", "", ""
     if placa_selecionada and not df_dados.empty and "Placa" in df_dados.columns:
         filtro = df_dados[df_dados["Placa"].astype(str) == placa_selecionada]
@@ -451,9 +416,8 @@ with aba_novo:
         campo_empresa = st.text_input("Campo 07: Empresa", value=empresa_val, key=f"empresa_{sufixo_chave}")
 
     st.markdown("---")
-    # Campo 08: Relato da Ocorrência (Caixa Longa)
     st.markdown("### Campo 08: Relato da Ocorrência")
-    st.caption("Use o ditado por voz do teclado do smartphone se preferir. Salve o relato para mantê-lo no arquivo local.")
+    st.caption("Use o ditado por voz do teclado do smartphone se preferir.")
     
     campo_relato = st.text_area(
         "Descrição detalhada dos fatos:",
@@ -463,7 +427,6 @@ with aba_novo:
     )
     st.caption(f"Caracteres digitados: {len(campo_relato)} / 4.000")
 
-    # Campo 09: Evidências
     st.markdown("---")
     st.markdown("### Campo 09: Evidências (Fotos / Anexos)")
     fotos_anexadas = st.file_uploader(
@@ -471,14 +434,23 @@ with aba_novo:
         type=["jpg", "png", "jpeg"],
         accept_multiple_files=True
     )
-    st.caption("Fotos e assinatura são incluídas no PDF baixado; o CSV local guarda os dados textuais.")
-    assinatura_anexada = st.file_uploader(
-        "Anexar imagem da assinatura do prestador (opcional)",
-        type=["jpg", "jpeg", "png"],
-        key="assinatura_prestador",
+
+    # Assinatura Digital na Tela do Celular
+    st.markdown("---")
+    st.markdown("### Assinatura do Prestador (Toque e Assine na Tela)")
+    st.caption("Utilize o dedo ou uma caneta stylus para assinar no quadro abaixo:")
+    
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 255, 255, 0)",
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        height=150,
+        width=340,
+        drawing_mode="freedraw",
+        key="canvas_assinatura",
     )
 
-    # Campos 10 e 11: Identificação do Relator
     st.markdown("---")
     st.markdown("### Identificação do Relator")
     
@@ -498,13 +470,11 @@ with aba_novo:
         elements = []
         styles = getSampleStyleSheet()
 
-        # Estilos customizados
         style_header = ParagraphStyle('HeaderStyle', parent=styles['Normal'], alignment=1, fontSize=9, leading=11, fontName='Helvetica-Bold')
         style_title = ParagraphStyle('TitleStyle', parent=styles['Normal'], alignment=1, fontSize=11, leading=14, fontName='Helvetica-Bold')
         style_body = ParagraphStyle('BodyStyle', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica')
         style_bold = ParagraphStyle('BoldStyle', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold')
 
-        # Cabeçalho Oficial
         header_text = """
         MINISTÉRIO DA DEFESA<br/>
         EXÉRCITO BRASILEIRO<br/>
@@ -515,11 +485,9 @@ with aba_novo:
         elements.append(Paragraph(header_text, style_header))
         elements.append(Spacer(1, 15))
 
-        # Título
         elements.append(Paragraph("RELATO DE OCORRÊNCIA NA FISCALIZAÇÃO OPERACIONAL", style_title))
         elements.append(Spacer(1, 15))
 
-        # Tabela de Dados Gerais
         dados_tabela = [
             [Paragraph("<b>Data:</b> " + escape(campo_data.strftime("%d/%m/%Y")), style_body), Paragraph("<b>Assunto:</b> " + escape(campo_assunto), style_body)],
             [Paragraph("<b>Placa:</b> " + escape(placa_selecionada), style_body), Paragraph("<b>Motorista:</b> " + escape(campo_motorista), style_body)],
@@ -536,20 +504,17 @@ with aba_novo:
         elements.append(t)
         elements.append(Spacer(1, 15))
 
-        # Bloco do Relato
         elements.append(Paragraph("<b>RELATO DA OCORRÊNCIA:</b>", style_bold))
         elements.append(Spacer(1, 5))
         elements.append(Paragraph(escape(campo_relato).replace("\n", "<br/>"), style_body))
         elements.append(Spacer(1, 15))
 
-        # Bloco de Anexos / Fotos (COM CORREÇÃO DE ORIENTAÇÃO EXIF)
         if fotos_anexadas:
             elements.append(Paragraph("<b>EVIDÊNCIAS FOTOGRÁFICAS:</b>", style_bold))
             elements.append(Spacer(1, 5))
             for foto in fotos_anexadas:
                 foto.seek(0)
                 img = Image.open(foto)
-                # Corrige a orientação automática baseada nos metadados EXIF do celular
                 img = ImageOps.exif_transpose(img)
                 if img.mode in ("RGBA", "P"):
                     img = img.convert("RGB")
@@ -560,19 +525,19 @@ with aba_novo:
                 elements.append(RLImage(img_buffer, width=img.width, height=img.height))
                 elements.append(Spacer(1, 10))
 
-        # Bloco de Assinaturas
         elements.append(Spacer(1, 20))
         
+        # Converte o desenho feito no canvas para imagem no PDF
         img_assinatura = Paragraph("_______________________________<br/>Assinatura do Prestador", style_body)
-        if assinatura_anexada is not None:
-            assinatura_anexada.seek(0)
-            img_pad = Image.open(assinatura_anexada)
-            img_pad = ImageOps.exif_transpose(img_pad)
-            img_pad.thumbnail((400, 160))
-            pad_buffer = io.BytesIO()
-            img_pad.convert("RGB").save(pad_buffer, format="PNG")
-            pad_buffer.seek(0)
-            img_assinatura = RLImage(pad_buffer, width=150, height=60)
+        if canvas_result.image_data is not None:
+            import numpy as np
+            arr = canvas_result.image_data
+            if arr.sum() > 0: # Verifica se o usuário realmente desenhou algo
+                img_assinatura_pil = Image.fromarray(arr.astype('uint8'), mode="RGBA")
+                pad_buffer = io.BytesIO()
+                img_assinatura_pil.convert("RGB").save(pad_buffer, format="PNG")
+                pad_buffer.seek(0)
+                img_assinatura = RLImage(pad_buffer, width=160, height=70)
 
         texto_govbr = Paragraph(
             f"_______________________________<br/><b>{escape(campo_posto)} {escape(campo_relator)}</b><br/>Espaço reservado p/ Assinatura GOV.BR",
@@ -590,7 +555,6 @@ with aba_novo:
         buffer.seek(0)
         return buffer
 
-    # Botões de Ação
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("💾 Salvar Ocorrência"):
@@ -652,7 +616,6 @@ with aba_novo:
             mime="application/pdf"
         )
 
-# Aba de Histórico e Consultas
 with aba_historico:
     st.subheader("Consultar Ocorrências Salvas")
     if usar_google_sheets() and st.button("Sincronizar relatos salvos offline"):
