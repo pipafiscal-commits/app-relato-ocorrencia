@@ -3,14 +3,13 @@ import pandas as pd
 from datetime import date, datetime
 import hmac
 import io
+import re
 from pathlib import Path
 from PIL import Image, ImageOps
 import gspread
-import requests
+import numpy as np
 from xml.sax.saxutils import escape
-from urllib.request import urlopen
 from streamlit.errors import StreamlitSecretNotFoundError
-from google.auth.exceptions import GoogleAuthError
 from streamlit_drawable_canvas import st_canvas
 
 # Dependências para geração de PDF
@@ -29,7 +28,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Estilização CSS para otimização em Smartphone
 st.markdown("""
     <style>
     .main { padding: 0.5rem; }
@@ -70,7 +68,6 @@ def exigir_autenticacao():
             st.session_state.autenticado = False
             st.rerun()
 
-
 exigir_autenticacao()
 
 # Caminhos locais e constantes
@@ -78,10 +75,12 @@ DADOS_LOCAIS_PATH = Path(__file__).with_name("dados_local.csv")
 BASE_PRESTADORES_PATH = Path(__file__).with_name("base_prestadores.csv")
 OCORRENCIAS_LOCAIS_PATH = Path(__file__).with_name("ocorrencias_local.csv")
 
+DEFAULT_SPREADSHEET_ID = "1PRy0XlQliIHXvM9Ou2HwmHwCrgq3iPpEWPY4XwxJ5qI"
 COLUNAS_BASE = ["Placa", "Motorista", "Nr Contrato", "Município", "Lote", "Empresa"]
 COLUNAS_BASE_OBRIGATORIAS = COLUNAS_BASE[:-1]
 COLUNAS_HISTORICO = [
     "id",
+    "numero_relato",
     "data",
     "placa",
     "assunto",
@@ -96,50 +95,72 @@ COLUNAS_HISTORICO = [
 ]
 
 # ==========================================
-# AUTENTICAÇÃO GOOGLE SHEETS (BLINDADA)
+# AUTENTICAÇÃO GOOGLE SHEETS (RECONSTRUÇÃO PEM)
 # ==========================================
+def reconstruir_pem_seguro(chave_bruta: str) -> str:
+    """Extrai o payload Base64 puro e remonta o arquivo PEM estritamente a cada 64 caracteres."""
+    texto = chave_bruta.replace("\\n", "\n").replace("\r", "")
+    # Remove cabeçalhos e qualquer espaço ou quebra de linha
+    corpo = re.sub(r"-----BEGIN [^-]+-----", "", texto)
+    corpo = re.sub(r"-----END [^-]+-----", "", corpo)
+    corpo = re.sub(r"\s+", "", corpo)
+    # Quebra estritamente em blocos de 64 caracteres conforme padrão RFC 7468
+    linhas = [corpo[i:i+64] for i in range(0, len(corpo), 64)]
+    return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(linhas) + "\n-----END PRIVATE KEY-----\n"
+
 @st.cache_resource
 def obter_cliente_gsheets():
     try:
         service_account = dict(st.secrets["gcp_service_account"])
         chave_privada = service_account.get("private_key", "")
-        if isinstance(chave_privada, str):
-            linhas_limpas = [
-                linha.strip() 
-                for linha in chave_privada.replace("\\n", "\n").replace("\r\n", "\n").split("\n") 
-                if linha.strip()
-            ]
-            service_account["private_key"] = "\n".join(linhas_limpas) + "\n"
+        if isinstance(chave_privada, str) and chave_privada.strip():
+            service_account["private_key"] = reconstruir_pem_seguro(chave_privada)
         return gspread.service_account_from_dict(service_account)
     except (StreamlitSecretNotFoundError, KeyError) as erro:
         raise ValueError("Configure gcp_service_account nas secrets.") from erro
 
+def obter_spreadsheet_id():
+    return st.secrets.get("storage", {}).get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
 
 @st.cache_resource
 def obter_aba_relatorios():
+    spreadsheet_id = obter_spreadsheet_id()
+    worksheet_title = st.secrets.get("storage", {}).get("worksheet", "Registro")
+    client = obter_cliente_gsheets()
+    planilha = client.open_by_key(spreadsheet_id)
     try:
-        configuracao_storage = st.secrets["storage"]
-        spreadsheet_id = configuracao_storage["spreadsheet_id"]
-        worksheet_title = configuracao_storage.get("worksheet", "Registro")
-        client = obter_cliente_gsheets()
-        planilha = client.open_by_key(spreadsheet_id)
-        try:
-            worksheet = planilha.worksheet(worksheet_title)
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = planilha.add_worksheet(title=worksheet_title, rows=1000, cols=15)
-    except (StreamlitSecretNotFoundError, KeyError) as erro:
-        raise ValueError(
-            "Configure storage.spreadsheet_id e gcp_service_account nas secrets."
-        ) from erro
+        worksheet = planilha.worksheet(worksheet_title)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = planilha.add_worksheet(title=worksheet_title, rows=2000, cols=15)
 
     cabecalho = worksheet.row_values(1)
     if not cabecalho:
         worksheet.append_row(COLUNAS_HISTORICO, value_input_option="RAW")
     elif cabecalho != COLUNAS_HISTORICO:
-        raise ValueError(
-            f"A primeira linha da aba '{worksheet_title}' deve conter os cabeçalhos do app."
-        )
+        # Atualiza cabeçalho se estiver no formato antigo sem 'numero_relato'
+        if "numero_relato" not in cabecalho and len(cabecalho) == len(COLUNAS_HISTORICO) - 1:
+            worksheet.insert_cols([["numero_relato"]], col=2)
+        else:
+            raise ValueError(
+                f"A primeira linha da aba '{worksheet_title}' deve conter: {', '.join(COLUNAS_HISTORICO)}"
+            )
     return worksheet
+
+# ==========================================
+# NUMERAÇÃO AUTOMÁTICA SEQUENCIAL (Nº xxxx/AAAA)
+# ==========================================
+def calcular_proximo_numero(worksheet, ano_referencia: int) -> str:
+    """Lê a coluna numero_relato diretamente da planilha para evitar colisão entre usuários."""
+    coluna_numeros = worksheet.col_values(2)[1:]  # Coluna B = numero_relato
+    maior_seq = 0
+    sufixo_ano = f"/{ano_referencia}"
+    for val in coluna_numeros:
+        val_str = str(val).strip()
+        if val_str.endswith(sufixo_ano):
+            parte_num = val_str.replace("Nº", "").replace(sufixo_ano, "").strip()
+            if parte_num.isdigit():
+                maior_seq = max(maior_seq, int(parte_num))
+    return f"Nº {maior_seq + 1:04d}/{ano_referencia}"
 
 # ==========================================
 # CARREGAMENTO DE DADOS (ONLINE / OFFLINE)
@@ -151,53 +172,43 @@ def filtrar_colunas_base(df):
     colunas_disponiveis = [coluna for coluna in COLUNAS_BASE if coluna in df.columns]
     return df.loc[:, colunas_disponiveis].copy()
 
-
 def usar_google_sheets():
     if st.session_state.get("forcar_offline", False):
         return False
-    try:
-        backend = st.secrets["storage"]["backend"]
-    except (StreamlitSecretNotFoundError, KeyError):
-        return False
-
-    if backend not in {"local", "google_sheets"}:
-        st.error("storage.backend deve ser 'local' ou 'google_sheets'.")
-        st.stop()
+    backend = st.secrets.get("storage", {}).get("backend", "google_sheets")
     return backend == "google_sheets"
 
-
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def buscar_dados_online():
-    configuracao_storage = st.secrets["storage"]
-    spreadsheet_id = configuracao_storage["spreadsheet_id"]
+    spreadsheet_id = obter_spreadsheet_id()
     client = obter_cliente_gsheets()
     planilha = client.open_by_key(spreadsheet_id)
     
     # 1. Carrega a base de prestadores
-    aba_base = configuracao_storage.get("base_worksheet", "Base")
+    aba_base = st.secrets.get("storage", {}).get("base_worksheet", "Base")
     try:
         ws_base = planilha.worksheet(aba_base)
     except gspread.exceptions.WorksheetNotFound:
         abas = [w for w in planilha.worksheets() if w.title not in ["Registro", "Ocorrência"]]
         ws_base = abas[0] if abas else planilha.worksheets()[0]
     
-    df_base = filtrar_colunas_base(pd.DataFrame(ws_base.get_all_records()).astype(str))
+    registros = ws_base.get_all_records()
+    df_base = filtrar_colunas_base(pd.DataFrame(registros).astype(str)) if registros else pd.DataFrame(columns=COLUNAS_BASE)
 
-    # 2. Carrega as ocorrências especificamente da coluna A da aba "Ocorrência"
+    # 2. Carrega todas as ocorrências da Coluna A da aba "Ocorrência"
     lista_ocorrencias = []
     try:
         ws_ocorrencia = planilha.worksheet("Ocorrência")
-        # Pega todos os valores da Coluna A (coluna 1)
         coluna_a = ws_ocorrencia.col_values(1)
-        # Remove cabeçalho (se houver, ex: ignorando a linha 1 se for título "Ocorrência") e limpa vazios
         if coluna_a:
-            # Se a primeira linha for o título, podemos ignorá-la se desejado, ou manter. Vamos limpar vazios:
-            lista_ocorrencias = [x.strip() for x in coluna_a if x and x.strip().lower() != "ocorrência"]
-    except Exception:
+            lista_ocorrencias = [
+                x.strip() for x in coluna_a 
+                if x and x.strip().lower() not in ("ocorrência", "ocorrencia")
+            ]
+    except gspread.exceptions.WorksheetNotFound:
         pass
 
     return df_base, lista_ocorrencias
-
 
 def carregar_dados():
     if not usar_google_sheets():
@@ -207,7 +218,6 @@ def carregar_dados():
                 df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
             except Exception:
                 pass
-        
         ocorrencias = []
         if OCORRENCIAS_LOCAIS_PATH.exists():
             try:
@@ -226,7 +236,6 @@ def carregar_dados():
                 df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
             except Exception:
                 pass
-        
         ocorrencias = []
         if OCORRENCIAS_LOCAIS_PATH.exists():
             try:
@@ -243,7 +252,6 @@ def carregar_dados():
         pass
     return df_base, ocorrencias, "Online (Google Sheets; cópia local atualizada)"
 
-
 if "dados_planilha" not in st.session_state:
     df_b, oc_l, status_inicial = carregar_dados()
     st.session_state.dados_planilha = df_b
@@ -255,7 +263,7 @@ with st.sidebar:
     modo_offline_manual = st.toggle(
         "Trabalhar Offline (Local)",
         value=st.session_state.get("forcar_offline", False),
-        help="Ative em áreas sem internet para salvar tudo localmente e sincronizar depois."
+        help="Ative em áreas sem internet para salvar localmente e sincronizar depois."
     )
     if modo_offline_manual != st.session_state.get("forcar_offline", False):
         st.session_state.forcar_offline = modo_offline_manual
@@ -292,7 +300,6 @@ with st.sidebar:
         use_container_width=True,
     )
 
-
 def carregar_historico_local():
     if not DADOS_LOCAIS_PATH.exists():
         return []
@@ -302,12 +309,10 @@ def carregar_historico_local():
         st.error(f"Não foi possível carregar o histórico local: {e}")
         return []
 
-
 def salvar_historico_local(historico):
     pd.DataFrame(historico, columns=COLUNAS_HISTORICO).to_csv(
         DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
     )
-
 
 def carregar_historico():
     if usar_google_sheets():
@@ -326,8 +331,8 @@ def carregar_historico():
             )
             try:
                 salvar_historico_local(historico)
-            except OSError as erro:
-                st.warning(f"Não foi possível atualizar a cópia local dos relatos: {erro}")
+            except OSError:
+                pass
             return historico
         except Exception as erro:
             st.warning(
@@ -336,7 +341,6 @@ def carregar_historico():
             )
 
     return carregar_historico_local()
-
 
 def sincronizar_historico_local():
     worksheet = obter_aba_relatorios()
@@ -353,15 +357,19 @@ def sincronizar_historico_local():
         if item.get("id") and item["id"] not in ids_remotos
     ]
     if pendentes:
-        worksheet.append_rows(
-            [
-                [item.get(coluna, "") for coluna in COLUNAS_HISTORICO]
-                for item in pendentes
-            ],
-            value_input_option="RAW",
-        )
+        ano_atual = datetime.now().year
+        linhas_para_enviar = []
+        for item in pendentes:
+            # Se foi gerado offline, atribui agora o número oficial sequencial
+            num_atual = str(item.get("numero_relato", ""))
+            if not num_atual or num_atual.startswith("OFF-"):
+                num_oficial = calcular_proximo_numero(worksheet, ano_atual)
+                item["numero_relato"] = num_oficial
+            linhas_para_enviar.append([item.get(coluna, "") for coluna in COLUNAS_HISTORICO])
+            # Envia linha por linha para garantir incrementação segura
+            worksheet.append_row(linhas_para_enviar[-1], value_input_option="RAW")
+        salvar_historico_local(historico_local)
     return len(pendentes)
-
 
 if "historico_ocorrencias" not in st.session_state:
     st.session_state.historico_ocorrencias = carregar_historico()
@@ -379,6 +387,10 @@ aba_novo, aba_historico = st.tabs(["✍️ Novo Relato", "🔍 Histórico / Cons
 with aba_novo:
     st.subheader("Dados da Fiscalização")
     
+    # Exibe o número oficial atribuído caso o relato atual já tenha sido salvo
+    num_exibicao = st.session_state.get("ultimo_numero_gerado", "Gerado automaticamente ao salvar")
+    st.info(f"**Identificação do Documento:** {num_exibicao}")
+
     campo_data = st.date_input("Campo 00: Data da Ocorrência", datetime.now())
 
     # Campo 01: Assunto da Ocorrência (Puxa direto da coluna A da aba 'Ocorrência')
@@ -387,7 +399,7 @@ with aba_novo:
         lista_ocorrencias = ["Nenhuma ocorrência encontrada na aba 'Ocorrência'"]
 
     campo_assunto = st.selectbox(
-        "Campo 01: Assunto da Ocorrência (Selecionado da aba 'Ocorrência')",
+        "Campo 01: Assunto da Ocorrência",
         options=lista_ocorrencias
     )
 
@@ -451,7 +463,6 @@ with aba_novo:
         accept_multiple_files=True
     )
 
-    # Assinatura Digital na Tela do Celular
     st.markdown("---")
     st.markdown("### Assinatura do Prestador (Toque e Assine na Tela)")
     st.caption("Utilize o dedo ou uma caneta stylus para assinar no quadro abaixo:")
@@ -480,7 +491,7 @@ with aba_novo:
     # ==========================================
     # ROTINA DE GERAÇÃO DO PDF (PADRÃO A4)
     # ==========================================
-    def gerar_pdf():
+    def gerar_pdf(numero_documento: str):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
         elements = []
@@ -501,7 +512,7 @@ with aba_novo:
         elements.append(Paragraph(header_text, style_header))
         elements.append(Spacer(1, 15))
 
-        elements.append(Paragraph("RELATO DE OCORRÊNCIA NA FISCALIZAÇÃO OPERACIONAL", style_title))
+        elements.append(Paragraph(f"RELATO DE OCORRÊNCIA NA FISCALIZAÇÃO OPERACIONAL — {escape(numero_documento)}", style_title))
         elements.append(Spacer(1, 15))
 
         dados_tabela = [
@@ -572,8 +583,12 @@ with aba_novo:
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("💾 Salvar Ocorrência"):
+            ano_oc = campo_data.year
+            numero_gerado = f"OFF-{datetime.now().strftime('%H%M%S')}/{ano_oc}"
+            
             nova_oc = {
                 "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+                "numero_relato": numero_gerado,
                 "data": campo_data.strftime("%Y-%m-%d"),
                 "placa": placa_selecionada,
                 "assunto": campo_assunto,
@@ -584,12 +599,15 @@ with aba_novo:
                 "municipio": campo_municipio,
                 "lote": campo_lote,
                 "empresa": campo_empresa,
-                "status": "Rascunho",
+                "status": "Registrado",
             }
             try:
                 if usar_google_sheets():
                     try:
-                        obter_aba_relatorios().append_row(
+                        ws = obter_aba_relatorios()
+                        numero_gerado = calcular_proximo_numero(ws, ano_oc)
+                        nova_oc["numero_relato"] = numero_gerado
+                        ws.append_row(
                             [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
                             value_input_option="RAW",
                         )
@@ -598,9 +616,9 @@ with aba_novo:
                         historico_local.append(nova_oc)
                         salvar_historico_local(historico_local)
                         st.session_state.historico_ocorrencias.append(nova_oc)
+                        st.session_state.ultimo_numero_gerado = numero_gerado
                         st.warning(
-                            "Google Sheets indisponível. Ocorrência salva neste dispositivo "
-                            f"para uso offline: {erro_online}"
+                            f"Google Sheets indisponível. Salvo localmente com protocolo provisório {numero_gerado}: {erro_online}"
                         )
                     else:
                         historico_local = carregar_historico_local()
@@ -608,25 +626,29 @@ with aba_novo:
                             historico_local.append(nova_oc)
                             try:
                                 salvar_historico_local(historico_local)
-                            except OSError as erro_local:
-                                st.warning(f"Relato enviado ao Google Sheets, mas não foi possível salvar a cópia local: {erro_local}")
+                            except OSError:
+                                pass
                         st.session_state.historico_ocorrencias.append(nova_oc)
-                        st.success("Ocorrência salva no Google Sheets.")
+                        st.session_state.ultimo_numero_gerado = numero_gerado
+                        st.success(f"Ocorrência salva com sucesso! Protocolo: **{numero_gerado}**")
                 else:
                     historico_atualizado = carregar_historico_local()
                     historico_atualizado.append(nova_oc)
                     salvar_historico_local(historico_atualizado)
                     st.session_state.historico_ocorrencias.append(nova_oc)
-                    st.success("Ocorrência salva localmente (Offline).")
+                    st.session_state.ultimo_numero_gerado = numero_gerado
+                    st.success(f"Ocorrência salva localmente (Offline). Protocolo: **{numero_gerado}**")
             except Exception as e:
                 st.error(f"Não foi possível salvar a ocorrência: {e}")
 
     with col_btn2:
-        pdf_bytes = gerar_pdf()
+        numero_para_pdf = st.session_state.get("ultimo_numero_gerado", f"Nº 0000/{campo_data.year}")
+        pdf_bytes = gerar_pdf(numero_para_pdf)
+        nome_arquivo_num = numero_para_pdf.replace("Nº ", "").replace("/", "-")
         st.download_button(
             label="🖨️ Imprimir em PDF (A4)",
             data=pdf_bytes,
-            file_name=f"Relato_{placa_selecionada}_{campo_data.strftime('%Y%m%d')}.pdf",
+            file_name=f"Relato_{nome_arquivo_num}_{placa_selecionada}.pdf",
             mime="application/pdf"
         )
 
