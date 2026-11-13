@@ -4,9 +4,7 @@ from datetime import date, datetime
 import hmac
 import io
 from pathlib import Path
-import socket
-from PIL import Image
-import qrcode
+from PIL import Image, ImageOps
 import gspread
 import requests
 from xml.sax.saxutils import escape
@@ -74,18 +72,7 @@ def exigir_autenticacao():
 
 exigir_autenticacao()
 
-def obter_ip_local():
-    conexao = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        conexao.connect(("8.8.8.8", 80))
-        return conexao.getsockname()[0]
-    except OSError:
-        enderecos = socket.gethostbyname_ex(socket.gethostname())[2]
-        return next((ip for ip in enderecos if not ip.startswith("127.")), None)
-    finally:
-        conexao.close()
-
-# URL export CSV da sua Planilha do Google
+# Caminhos locais e constantes
 DADOS_LOCAIS_PATH = Path(__file__).with_name("dados_local.csv")
 BASE_PRESTADORES_PATH = Path(__file__).with_name("base_prestadores.csv")
 COLUNAS_BASE = ["Placa", "Motorista", "Nr Contrato", "Município", "Lote", "Empresa", "Ocorrência"]
@@ -112,6 +99,53 @@ OCORRENCIAS_PADRAO = [
 ]
 
 # ==========================================
+# AUTENTICAÇÃO GOOGLE SHEETS (BLINDADA)
+# ==========================================
+@st.cache_resource
+def obter_cliente_gsheets():
+    try:
+        service_account = dict(st.secrets["gcp_service_account"])
+        chave_privada = service_account.get("private_key", "")
+        if isinstance(chave_privada, str):
+            # Remove espaços de indentação em cada linha e normaliza quebras
+            linhas_limpas = [
+                linha.strip() 
+                for linha in chave_privada.replace("\\n", "\n").replace("\r\n", "\n").split("\n") 
+                if linha.strip()
+            ]
+            service_account["private_key"] = "\n".join(linhas_limpas) + "\n"
+        return gspread.service_account_from_dict(service_account)
+    except (StreamlitSecretNotFoundError, KeyError) as erro:
+        raise ValueError("Configure gcp_service_account nas secrets.") from erro
+
+
+@st.cache_resource
+def obter_aba_relatorios():
+    try:
+        configuracao_storage = st.secrets["storage"]
+        spreadsheet_id = configuracao_storage["spreadsheet_id"]
+        worksheet_title = configuracao_storage.get("worksheet", "Registro")
+        client = obter_cliente_gsheets()
+        planilha = client.open_by_key(spreadsheet_id)
+        try:
+            worksheet = planilha.worksheet(worksheet_title)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = planilha.add_worksheet(title=worksheet_title, rows=1000, cols=15)
+    except (StreamlitSecretNotFoundError, KeyError) as erro:
+        raise ValueError(
+            "Configure storage.spreadsheet_id e gcp_service_account nas secrets."
+        ) from erro
+
+    cabecalho = worksheet.row_values(1)
+    if not cabecalho:
+        worksheet.append_row(COLUNAS_HISTORICO, value_input_option="RAW")
+    elif cabecalho != COLUNAS_HISTORICO:
+        raise ValueError(
+            f"A primeira linha da aba '{worksheet_title}' deve conter os cabeçalhos do app."
+        )
+    return worksheet
+
+# ==========================================
 # CARREGAMENTO DE DADOS (ONLINE / OFFLINE)
 # ==========================================
 def filtrar_colunas_base(df):
@@ -123,6 +157,8 @@ def filtrar_colunas_base(df):
 
 
 def usar_google_sheets():
+    if st.session_state.get("forcar_offline", False):
+        return False
     try:
         backend = st.secrets["storage"]["backend"]
     except (StreamlitSecretNotFoundError, KeyError):
@@ -136,16 +172,31 @@ def usar_google_sheets():
 
 @st.cache_data(ttl=600)
 def buscar_dados_online():
-    try:
-        url_planilha = st.secrets["data"]["sheet_url"]
-    except (StreamlitSecretNotFoundError, KeyError) as erro:
-        raise ValueError("Configure data.sheet_url nas secrets do Streamlit.") from erro
+    # Tenta primeiro via URL pública CSV se configurada, senão lê via API (gspread)
+    url_planilha = st.secrets.get("data", {}).get("sheet_url")
+    if url_planilha and "export?format=csv" in url_planilha:
+        with urlopen(url_planilha, timeout=15) as resposta:
+            conteudo = resposta.read()
+        df = filtrar_colunas_base(pd.read_csv(io.BytesIO(conteudo), dtype=str).fillna(""))
+    else:
+        configuracao_storage = st.secrets["storage"]
+        spreadsheet_id = configuracao_storage["spreadsheet_id"]
+        aba_base = configuracao_storage.get("base_worksheet", "Base")
+        client = obter_cliente_gsheets()
+        planilha = client.open_by_key(spreadsheet_id)
+        try:
+            ws = planilha.worksheet(aba_base)
+        except gspread.exceptions.WorksheetNotFound:
+            # Se não houver aba 'Base', pega a primeira aba que não seja 'Registro'
+            abas = [w for w in planilha.worksheets() if w.title != configuracao_storage.get("worksheet", "Registro")]
+            if not abas:
+                raise ValueError("Nenhuma aba de base de prestadores encontrada na planilha.")
+            ws = abas[0]
+        registros = ws.get_all_records()
+        df = filtrar_colunas_base(pd.DataFrame(registros).astype(str))
 
-    with urlopen(url_planilha, timeout=15) as resposta:
-        conteudo = resposta.read()
-    df = filtrar_colunas_base(pd.read_csv(io.BytesIO(conteudo)))
     if df.empty:
-        raise ValueError("A planilha não contém registros.")
+        raise ValueError("A base de prestadores não contém registros.")
     return df
 
 
@@ -157,27 +208,25 @@ def carregar_dados():
                     pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna("")
                 )
                 if not df.empty:
-                    return df, "Offline (base local)"
+                    return df, "Offline (base local carregada)"
             except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro:
                 st.error(f"Não foi possível carregar a cópia local da planilha: {erro}")
-        return pd.DataFrame(columns=COLUNAS_BASE), "Offline (sem cópia local da base)"
+        return pd.DataFrame(columns=COLUNAS_BASE), "Offline (sem cópia local — preenchimento manual liberado)"
 
     try:
         df = buscar_dados_online()
-    except (OSError, ValueError, pd.errors.ParserError) as erro_online:
+    except Exception as erro_online:
         if BASE_PRESTADORES_PATH.exists():
             try:
                 df = filtrar_colunas_base(
                     pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna("")
                 )
-                if df.empty:
-                    raise pd.errors.EmptyDataError("A cópia local não contém registros.")
-                df.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-                return df, f"Offline (cópia local salva; falha ao acessar a planilha: {erro_online})"
-            except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro_local:
+                if not df.empty:
+                    return df, f"Offline (usando cópia local; falha online: {erro_online})"
+            except Exception as erro_local:
                 st.error(f"Não foi possível carregar a cópia local da planilha: {erro_local}")
 
-        return pd.DataFrame(), f"Offline (sem cópia válida da planilha; falha ao acessar a planilha: {erro_online})"
+        return pd.DataFrame(columns=COLUNAS_BASE), f"Offline (sem base local; falha online: {erro_online})"
 
     try:
         df.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
@@ -185,37 +234,33 @@ def carregar_dados():
         st.error(f"Não foi possível salvar a cópia local da planilha: {erro}")
     return df, "Online (Google Sheets; cópia local atualizada)"
 
+
 if "dados_planilha" not in st.session_state:
     dados_iniciais, status_inicial = carregar_dados()
     st.session_state.dados_planilha = dados_iniciais
     st.session_state.status_base = status_inicial
 
 with st.sidebar:
-    st.header("Acesso pelo celular")
-    url_publica = st.secrets.get("app", {}).get("public_url")
-    ip_local = obter_ip_local() if not url_publica else None
-    if url_publica:
-        link_celular = url_publica.rstrip("/")
-        st.code(link_celular)
-        st.image(qrcode.make(link_celular).get_image(), caption="Acesse pelo link público")
-    elif ip_local:
-        link_celular = f"http://{ip_local}:8501"
-        st.code(link_celular)
-        st.image(qrcode.make(link_celular).get_image(), caption="Escaneie na mesma rede Wi-Fi")
-    else:
-        st.warning("Não foi possível detectar o endereço da rede local.")
+    st.header("Modo de Operação")
+    modo_offline_manual = st.toggle(
+        "Trabalhar Offline (Local)",
+        value=st.session_state.get("forcar_offline", False),
+        help="Ative em áreas sem internet para salvar tudo localmente e sincronizar depois."
+    )
+    if modo_offline_manual != st.session_state.get("forcar_offline", False):
+        st.session_state.forcar_offline = modo_offline_manual
+        dados_iniciais, status_inicial = carregar_dados()
+        st.session_state.dados_planilha = dados_iniciais
+        st.session_state.status_base = status_inicial
+        st.rerun()
 
     st.header("Base de dados")
-    st.caption(
-        "Para trabalhar sem Google Sheets, defina storage.backend como 'local' "
-        "nas secrets. A base e os relatos serão guardados em arquivos CSV neste servidor."
-    )
     if usar_google_sheets() and st.button("Atualizar base da planilha"):
         buscar_dados_online.clear()
         try:
             df_atualizado = buscar_dados_online()
             df_atualizado.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-        except (OSError, ValueError, pd.errors.ParserError) as erro:
+        except Exception as erro:
             st.error(f"Não foi possível atualizar a base: {erro}")
         else:
             st.session_state.dados_planilha = df_atualizado
@@ -226,7 +271,7 @@ with st.sidebar:
     status_conexao = st.session_state.status_base
     csv_para_baixar = df_dados.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "Baixar base CSV para o celular",
+        "Baixar base CSV para backup",
         data=csv_para_baixar,
         file_name="base_prestadores.csv",
         mime="text/csv",
@@ -249,13 +294,30 @@ with st.sidebar:
                 if df_local.empty:
                     raise ValueError("O arquivo CSV não contém registros.")
                 df_local.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-            except (OSError, UnicodeDecodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError) as erro:
+            except Exception as erro:
                 st.error(f"Não foi possível salvar a base offline: {erro}")
             else:
                 st.session_state.dados_planilha = df_local
                 st.session_state.status_base = "Offline (base local importada)"
                 st.success("Base CSV salva para uso offline.")
                 st.rerun()
+
+
+def carregar_historico_local():
+    if not DADOS_LOCAIS_PATH.exists():
+        return []
+    try:
+        return pd.read_csv(DADOS_LOCAIS_PATH, dtype=str).fillna("").to_dict("records")
+    except Exception as e:
+        st.error(f"Não foi possível carregar o histórico local: {e}")
+        return []
+
+
+def salvar_historico_local(historico):
+    pd.DataFrame(historico, columns=COLUNAS_HISTORICO).to_csv(
+        DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
+    )
+
 
 def carregar_historico():
     if usar_google_sheets():
@@ -277,63 +339,13 @@ def carregar_historico():
             except OSError as erro:
                 st.warning(f"Não foi possível atualizar a cópia local dos relatos: {erro}")
             return historico
-        except (
-            ValueError,
-            gspread.exceptions.GSpreadException,
-            requests.exceptions.RequestException,
-            GoogleAuthError,
-        ) as erro:
+        except Exception as erro:
             st.warning(
                 "Não foi possível acessar os relatos no Google Sheets. "
                 f"Usando o histórico local: {erro}"
             )
 
     return carregar_historico_local()
-
-
-def carregar_historico_local():
-    if not DADOS_LOCAIS_PATH.exists():
-        return []
-    try:
-        return pd.read_csv(DADOS_LOCAIS_PATH, dtype=str).fillna("").to_dict("records")
-    except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
-        st.error(f"Não foi possível carregar o histórico local: {e}")
-        return []
-
-
-def salvar_historico_local(historico):
-    pd.DataFrame(historico, columns=COLUNAS_HISTORICO).to_csv(
-        DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
-    )
-
-
-@st.cache_resource
-def obter_aba_relatorios():
-    try:
-        configuracao_storage = st.secrets["storage"]
-        service_account = dict(st.secrets["gcp_service_account"])
-        spreadsheet_id = configuracao_storage["spreadsheet_id"]
-        worksheet_title = configuracao_storage.get("worksheet", "Registro")
-        chave_privada = service_account.get("private_key")
-        if isinstance(chave_privada, str):
-            service_account["private_key"] = (
-                chave_privada.replace("\\n", "\n").replace("\r\n", "\n").strip()
-            )
-        client = gspread.service_account_from_dict(service_account)
-        worksheet = client.open_by_key(spreadsheet_id).worksheet(worksheet_title)
-    except (StreamlitSecretNotFoundError, KeyError) as erro:
-        raise ValueError(
-            "Configure storage.spreadsheet_id e gcp_service_account nas secrets."
-        ) from erro
-
-    cabecalho = worksheet.row_values(1)
-    if not cabecalho:
-        worksheet.append_row(COLUNAS_HISTORICO, value_input_option="RAW")
-    elif cabecalho != COLUNAS_HISTORICO:
-        raise ValueError(
-            f"A primeira linha da aba '{worksheet_title}' deve conter os cabeçalhos do app."
-        )
-    return worksheet
 
 
 def sincronizar_historico_local():
@@ -371,7 +383,7 @@ if "historico_ocorrencias" not in st.session_state:
 st.title("📋 Relato de Ocorrência")
 st.caption(f"Status da Base de Dados: **{status_conexao}**")
 if status_conexao.startswith("Offline"):
-    st.warning(status_conexao)
+    st.info(status_conexao)
 
 # Navegação por Abas
 aba_novo, aba_historico = st.tabs(["✍️ Novo Relato", "🔍 Histórico / Consultas"])
@@ -399,25 +411,34 @@ with aba_novo:
     st.markdown("---")
     st.markdown("### Busca do Prestador (Ênfase na Placa)")
     
-    # Busca com Ênfase na Placa
+    # Busca com Ênfase na Placa (permite digitar manualmente se estiver sem base offline)
     placas = df_dados["Placa"].dropna().astype(str).unique().tolist() if "Placa" in df_dados.columns else []
-    opcoes_placa = [""] + placas
-    placa_selecionada = st.selectbox("Campo 02: Placa do Veículo (Busca Principal)", opcoes_placa)
+    if placas:
+        opcoes_placa = ["", "-- Digitar placa manualmente --"] + placas
+        placa_escolha = st.selectbox("Campo 02: Placa do Veículo (Busca Principal)", opcoes_placa)
+        if placa_escolha == "-- Digitar placa manualmente --":
+            placa_selecionada = st.text_input("Digite a Placa do Veículo (Ex: ABC1D23):").upper()
+        else:
+            placa_selecionada = placa_escolha
+    else:
+        placa_selecionada = st.text_input("Campo 02: Placa do Veículo (Ex: ABC1D23):").upper()
     
     # Autofill dos dados baseados na Placa
     motorista_val, contrato_val, mun_val, lote_val, empresa_val = "", "", "", "", ""
-    if placa_selecionada:
-        registro = df_dados[df_dados["Placa"].astype(str) == placa_selecionada].iloc[0]
+    if placa_selecionada and not df_dados.empty and "Placa" in df_dados.columns:
+        filtro = df_dados[df_dados["Placa"].astype(str) == placa_selecionada]
+        if not filtro.empty:
+            registro = filtro.iloc[0]
 
-        def valor_texto(campo):
-            valor = registro.get(campo, "")
-            return "" if pd.isna(valor) else str(valor)
+            def valor_texto(campo):
+                valor = registro.get(campo, "")
+                return "" if pd.isna(valor) else str(valor)
 
-        motorista_val = valor_texto("Motorista")
-        contrato_val = valor_texto("Nr Contrato")
-        mun_val = valor_texto("Município")
-        lote_val = valor_texto("Lote")
-        empresa_val = valor_texto("Empresa")
+            motorista_val = valor_texto("Motorista")
+            contrato_val = valor_texto("Nr Contrato")
+            mun_val = valor_texto("Município")
+            lote_val = valor_texto("Lote")
+            empresa_val = valor_texto("Empresa")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -521,28 +542,32 @@ with aba_novo:
         elements.append(Paragraph(escape(campo_relato).replace("\n", "<br/>"), style_body))
         elements.append(Spacer(1, 15))
 
-        # Bloco de Anexos / Fotos
+        # Bloco de Anexos / Fotos (COM CORREÇÃO DE ORIENTAÇÃO EXIF)
         if fotos_anexadas:
             elements.append(Paragraph("<b>EVIDÊNCIAS FOTOGRÁFICAS:</b>", style_bold))
             elements.append(Spacer(1, 5))
             for foto in fotos_anexadas:
                 foto.seek(0)
                 img = Image.open(foto)
+                # Corrige a orientação automática baseada nos metadados EXIF do celular
+                img = ImageOps.exif_transpose(img)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
                 img.thumbnail((400, 250))
                 img_buffer = io.BytesIO()
-                img.save(img_buffer, format="PNG")
+                img.save(img_buffer, format="JPEG", quality=85)
                 img_buffer.seek(0)
-                elements.append(RLImage(img_buffer))
+                elements.append(RLImage(img_buffer, width=img.width, height=img.height))
                 elements.append(Spacer(1, 10))
 
         # Bloco de Assinaturas
         elements.append(Spacer(1, 20))
         
-        # Preparar imagem da assinatura, se anexada.
         img_assinatura = Paragraph("_______________________________<br/>Assinatura do Prestador", style_body)
         if assinatura_anexada is not None:
             assinatura_anexada.seek(0)
             img_pad = Image.open(assinatura_anexada)
+            img_pad = ImageOps.exif_transpose(img_pad)
             img_pad.thumbnail((400, 160))
             pad_buffer = io.BytesIO()
             img_pad.convert("RGB").save(pad_buffer, format="PNG")
@@ -590,13 +615,7 @@ with aba_novo:
                             [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
                             value_input_option="RAW",
                         )
-                    except (
-                        OSError,
-                        ValueError,
-                        gspread.exceptions.GSpreadException,
-                        requests.exceptions.RequestException,
-                        GoogleAuthError,
-                    ) as erro_online:
+                    except Exception as erro_online:
                         historico_local = carregar_historico_local()
                         historico_local.append(nova_oc)
                         salvar_historico_local(historico_local)
@@ -620,14 +639,8 @@ with aba_novo:
                     historico_atualizado.append(nova_oc)
                     salvar_historico_local(historico_atualizado)
                     st.session_state.historico_ocorrencias.append(nova_oc)
-                    st.success("Ocorrência salva localmente.")
-            except (
-                OSError,
-                ValueError,
-                gspread.exceptions.GSpreadException,
-                requests.exceptions.RequestException,
-                GoogleAuthError,
-            ) as e:
+                    st.success("Ocorrência salva localmente (Offline).")
+            except Exception as e:
                 st.error(f"Não foi possível salvar a ocorrência: {e}")
 
     with col_btn2:
@@ -645,13 +658,7 @@ with aba_historico:
     if usar_google_sheets() and st.button("Sincronizar relatos salvos offline"):
         try:
             quantidade = sincronizar_historico_local()
-        except (
-            OSError,
-            ValueError,
-            gspread.exceptions.GSpreadException,
-            requests.exceptions.RequestException,
-            GoogleAuthError,
-        ) as erro:
+        except Exception as erro:
             st.error(f"Não foi possível sincronizar os relatos locais: {erro}")
         else:
             st.success(f"Sincronização concluída: {quantidade} relato(s) enviado(s).")
