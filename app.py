@@ -99,59 +99,44 @@ COLUNAS_HISTORICO = [
 # ==========================================
 # AUTENTICAÇÃO GOOGLE SHEETS (RECONSTRUÇÃO PEM)
 # ==========================================
+import base64
+import json
+
 def reconstruir_pem_seguro(chave_bruta: str) -> str:
-    texto = chave_bruta.replace("\\n", "\n").replace("\r", "")
+    # 1. Converte literais "\n" e "\r" em quebras reais antes de limpar
+    texto = chave_bruta.replace("\\r", "").replace("\\n", "\n")
+    # 2. Remove cabeçalhos, rodapés e aspas eventuais
     corpo = re.sub(r"-----BEGIN [^-]+-----", "", texto)
     corpo = re.sub(r"-----END [^-]+-----", "", corpo)
-    corpo = re.sub(r"\s+", "", corpo)
+    # 3. Mantém estritamente caracteres válidos de Base64 (A-Z, a-z, 0-9, +, /, =)
+    corpo = re.sub(r"[^A-Za-z0-9+/=]", "", corpo)
+    # 4. Valida e normaliza o padding Base64
+    corpo_sem_pad = corpo.rstrip("=")
+    faltando = len(corpo_sem_pad) % 4
+    if faltando:
+        corpo = corpo_sem_pad + ("=" * (4 - faltando))
+    else:
+        corpo = corpo_sem_pad
+    # 5. Quebra em linhas de 64 caracteres conforme RFC 7468
     linhas = [corpo[i:i+64] for i in range(0, len(corpo), 64)]
     return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(linhas) + "\n-----END PRIVATE KEY-----\n"
 
 @st.cache_resource
 def obter_cliente_gsheets():
     try:
-        service_account = dict(st.secrets["gcp_service_account"])
+        # Suporta caso você cole o JSON inteiro em gcp_service_account_json
+        if "gcp_service_account_json" in st.secrets:
+            raw = st.secrets["gcp_service_account_json"]
+            service_account = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        else:
+            service_account = dict(st.secrets["gcp_service_account"])
+
         chave_privada = service_account.get("private_key", "")
         if isinstance(chave_privada, str) and chave_privada.strip():
             service_account["private_key"] = reconstruir_pem_seguro(chave_privada)
         return gspread.service_account_from_dict(service_account)
     except (StreamlitSecretNotFoundError, KeyError) as erro:
         raise ValueError("Configure gcp_service_account nas secrets.") from erro
-
-def obter_spreadsheet_id():
-    return st.secrets.get("storage", {}).get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
-
-@st.cache_resource
-def obter_aba_relatorios():
-    spreadsheet_id = obter_spreadsheet_id()
-    worksheet_title = st.secrets.get("storage", {}).get("worksheet", "Registro")
-    client = obter_cliente_gsheets()
-    planilha = client.open_by_key(spreadsheet_id)
-    try:
-        worksheet = planilha.worksheet(worksheet_title)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = planilha.add_worksheet(title=worksheet_title, rows=2000, cols=15)
-
-    cabecalho = worksheet.row_values(1)
-    if not cabecalho:
-        worksheet.append_row(COLUNAS_HISTORICO, value_input_option="RAW")
-    elif cabecalho != COLUNAS_HISTORICO:
-        if "numero_relato" not in cabecalho and len(cabecalho) == len(COLUNAS_HISTORICO) - 1:
-            worksheet.insert_cols([["numero_relato"]], col=2)
-    return worksheet
-
-def calcular_proximo_numero(worksheet, ano_referencia: int) -> str:
-    coluna_numeros = worksheet.col_values(2)[1:]
-    maior_seq = 0
-    sufixo_ano = f"/{ano_referencia}"
-    for val in coluna_numeros:
-        val_str = str(val).strip()
-        if val_str.endswith(sufixo_ano):
-            parte_num = val_str.replace("Nº", "").replace(sufixo_ano, "").strip()
-            if parte_num.isdigit():
-                maior_seq = max(maior_seq, int(parte_num))
-    return f"Nº {maior_seq + 1:04d}/{ano_referencia}"
-
 # ==========================================
 # CARREGAMENTO DE DADOS EM MEMÓRIA
 # ==========================================
