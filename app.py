@@ -5,13 +5,12 @@ import hmac
 import io
 import json
 import re
-from pathlib import Path
 from PIL import Image, ImageOps
 import gspread
 from xml.sax.saxutils import escape
 from streamlit.errors import StreamlitSecretNotFoundError
 
-# Canvas opcional (não trava o app se não estiver instalado)
+# Canvas opcional para assinatura na tela
 try:
     from streamlit_drawable_canvas import st_canvas
     HAS_CANVAS = True
@@ -77,11 +76,7 @@ def exigir_autenticacao():
 
 exigir_autenticacao()
 
-# Caminhos locais e constantes
-DADOS_LOCAIS_PATH = Path(__file__).with_name("dados_local.csv")
-BASE_PRESTADORES_PATH = Path(__file__).with_name("base_prestadores.csv")
-OCORRENCIAS_LOCAIS_PATH = Path(__file__).with_name("ocorrencias_local.csv")
-
+# Constantes da Planilha (100% em memória, sem CSVs no GitHub)
 DEFAULT_SPREADSHEET_ID = "1PRy0XlQliIHXvM9Ou2HwmHwCrgq3iPpEWPY4XwxJ5qI"
 COLUNAS_BASE = ["Placa", "Motorista", "Nr Contrato", "Município", "Lote", "Empresa"]
 COLUNAS_BASE_OBRIGATORIAS = COLUNAS_BASE[:-1]
@@ -158,7 +153,7 @@ def calcular_proximo_numero(worksheet, ano_referencia: int) -> str:
     return f"Nº {maior_seq + 1:04d}/{ano_referencia}"
 
 # ==========================================
-# CARREGAMENTO DE DADOS (ONLINE / OFFLINE)
+# CARREGAMENTO DE DADOS EM MEMÓRIA
 # ==========================================
 def filtrar_colunas_base(df):
     ausentes = [coluna for coluna in COLUNAS_BASE_OBRIGATORIAS if coluna not in df.columns]
@@ -167,18 +162,13 @@ def filtrar_colunas_base(df):
     colunas_disponiveis = [coluna for coluna in COLUNAS_BASE if coluna in df.columns]
     return df.loc[:, colunas_disponiveis].copy()
 
-def usar_google_sheets():
-    if st.session_state.get("forcar_offline", False):
-        return False
-    backend = st.secrets.get("storage", {}).get("backend", "google_sheets")
-    return backend == "google_sheets"
-
 @st.cache_data(ttl=300)
 def buscar_dados_online():
     spreadsheet_id = obter_spreadsheet_id()
     client = obter_cliente_gsheets()
     planilha = client.open_by_key(spreadsheet_id)
 
+    # 1. Aba Dados (Prestadores)
     try:
         ws_base = planilha.worksheet("Dados")
     except gspread.exceptions.WorksheetNotFound:
@@ -187,6 +177,7 @@ def buscar_dados_online():
     registros = ws_base.get_all_records()
     df_base = filtrar_colunas_base(pd.DataFrame(registros).astype(str)) if registros else pd.DataFrame(columns=COLUNAS_BASE)
 
+    # 2. Aba Ocorrência (Coluna A)
     lista_ocorrencias = []
     try:
         ws_ocorrencia = planilha.worksheet("Ocorrência")
@@ -201,53 +192,72 @@ def buscar_dados_online():
 
     return df_base, lista_ocorrencias
 
-def carregar_dados():
-    if not usar_google_sheets():
-        df_base = pd.DataFrame(columns=COLUNAS_BASE)
-        if BASE_PRESTADORES_PATH.exists():
-            try:
-                df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
-            except Exception:
-                pass
-        ocorrencias = []
-        if OCORRENCIAS_LOCAIS_PATH.exists():
-            try:
-                df_oc = pd.read_csv(OCORRENCIAS_LOCAIS_PATH, dtype=str)
-                ocorrencias = df_oc.iloc[:, 0].dropna().astype(str).tolist()
-            except Exception:
-                pass
-        return df_base, ocorrencias, "Offline (base local carregada)"
-
+def carregar_dados_memoria():
+    if st.session_state.get("forcar_offline", False):
+        return (
+            st.session_state.get("dados_planilha", pd.DataFrame(columns=COLUNAS_BASE)),
+            st.session_state.get("lista_ocorrencias", []),
+            "Modo Offline Manual (dados mantidos na memória da sessão)"
+        )
     try:
         df_base, ocorrencias = buscar_dados_online()
+        return df_base, ocorrencias, "Online (Google Sheets ativo)"
     except Exception as erro_online:
-        df_base = pd.DataFrame(columns=COLUNAS_BASE)
-        if BASE_PRESTADORES_PATH.exists():
-            try:
-                df_base = filtrar_colunas_base(pd.read_csv(BASE_PRESTADORES_PATH, dtype=str).fillna(""))
-            except Exception:
-                pass
-        ocorrencias = []
-        if OCORRENCIAS_LOCAIS_PATH.exists():
-            try:
-                df_oc = pd.read_csv(OCORRENCIAS_LOCAIS_PATH, dtype=str)
-                ocorrencias = df_oc.iloc[:, 0].dropna().astype(str).tolist()
-            except Exception:
-                pass
-        return df_base, ocorrencias, f"Offline (usando cópia local; falha online: {erro_online})"
+        return (
+            st.session_state.get("dados_planilha", pd.DataFrame(columns=COLUNAS_BASE)),
+            st.session_state.get("lista_ocorrencias", []),
+            f"Sem conexão com Google Sheets ({erro_online})"
+        )
 
+def carregar_historico_memoria():
+    if st.session_state.get("forcar_offline", False):
+        return st.session_state.get("historico_ocorrencias", [])
     try:
-        df_base.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-        pd.DataFrame({"Ocorrência": ocorrencias}).to_csv(OCORRENCIAS_LOCAIS_PATH, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
-    return df_base, ocorrencias, "Online (Google Sheets; cópia local atualizada)"
+        linhas = obter_aba_relatorios().get_all_values()
+        historico_remoto = [
+            dict(zip(COLUNAS_HISTORICO, linha))
+            for linha in linhas[1:]
+            if linha
+        ]
+        ids_remotos = {item.get("id") for item in historico_remoto}
+        pendentes_sessao = [
+            item for item in st.session_state.get("historico_ocorrencias", [])
+            if item.get("id") and item.get("id") not in ids_remotos
+        ]
+        return historico_remoto + pendentes_sessao
+    except Exception as erro:
+        st.warning(f"Não foi possível carregar o histórico do Google Sheets: {erro}")
+        return st.session_state.get("historico_ocorrencias", [])
+
+def sincronizar_pendentes_sessao():
+    worksheet = obter_aba_relatorios()
+    historico_sessao = st.session_state.get("historico_ocorrencias", [])
+    linhas_remotas = worksheet.get_all_values()
+    indice_id = COLUNAS_HISTORICO.index("id")
+    ids_remotos = {
+        linha[indice_id]
+        for linha in linhas_remotas[1:]
+        if len(linha) > indice_id and linha[indice_id]
+    }
+    pendentes = [
+        item for item in historico_sessao
+        if item.get("id") and item["id"] not in ids_remotos
+    ]
+    if pendentes:
+        ano_atual = datetime.now().year
+        for item in pendentes:
+            num_atual = str(item.get("numero_relato", ""))
+            if not num_atual or num_atual.startswith("OFF-"):
+                item["numero_relato"] = calcular_proximo_numero(worksheet, ano_atual)
+            linha_formatada = [item.get(coluna, "") for coluna in COLUNAS_HISTORICO]
+            worksheet.append_row(linha_formatada, value_input_option="RAW")
+    return len(pendentes)
 
 # ==========================================
 # GERADOR DE APP OFFLINE AUTÔNOMO (.HTML)
 # ==========================================
 def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str:
-    """Gera um arquivo HTML autônomo para uso 100% offline no navegador do celular."""
+    """Gera um arquivo HTML autônomo com os dados embutidos para uso 100% offline no celular."""
     base_registros = df_base.fillna("").to_dict(orient="records") if not df_base.empty else []
     base_json = json.dumps(base_registros, ensure_ascii=False)
     ocorrencias_json = json.dumps(ocorrencias, ensure_ascii=False)
@@ -308,9 +318,7 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
     @media (max-width: 600px) {{
       .grid-2 {{ grid-template-columns: 1fr; }}
     }}
-    .campo {{
-      margin-bottom: 12px;
-    }}
+    .campo {{ margin-bottom: 12px; }}
     label {{
       display: block;
       font-weight: bold;
@@ -325,10 +333,7 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
       border-radius: 5px;
       background: #fff;
     }}
-    textarea {{
-      min-height: 140px;
-      resize: vertical;
-    }}
+    textarea {{ min-height: 140px; resize: vertical; }}
     canvas {{
       width: 100%;
       height: 150px;
@@ -521,11 +526,9 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
     const STORAGE_KEY = "relatos_carro_pipa_offline_v1";
     const ANO_REF = {ano_atual};
 
-    // Inicializa data de hoje
     const hoje = new Date().toISOString().split("T")[0];
     document.getElementById("data_oc").value = hoje;
 
-    // Popula ocorrências
     const selOc = document.getElementById("assunto_oc");
     const opcoesOc = LISTA_OCORRENCIAS.length ? LISTA_OCORRENCIAS : [
       "Abastecimento fora do horário regulamentar estabelecido",
@@ -540,7 +543,6 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
       selOc.appendChild(opt);
     }});
 
-    // Popula placas
     const selPlaca = document.getElementById("placa_select");
     BASE_PRESTADORES.forEach(reg => {{
       if (reg.Placa) {{
@@ -565,7 +567,6 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
       }}
     }}
 
-    // Canvas de assinatura com toque e mouse
     const canvas = document.getElementById("assinatura_canvas");
     const ctx = canvas.getContext("2d");
     ctx.strokeStyle = "#000000";
@@ -734,14 +735,20 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
 """
 
 # ==========================================
-# CARREGAMENTO INICIAL
+# CARREGAMENTO INICIAL EM MEMÓRIA
 # ==========================================
 if "dados_planilha" not in st.session_state:
-    df_b, oc_l, status_inicial = carregar_dados()
+    df_b, oc_l, status_inicial = carregar_dados_memoria()
     st.session_state.dados_planilha = df_b
     st.session_state.lista_ocorrencias = oc_l
     st.session_state.status_base = status_inicial
 
+if "historico_ocorrencias" not in st.session_state:
+    st.session_state.historico_ocorrencias = carregar_historico_memoria()
+
+# ==========================================
+# BARRA LATERAL
+# ==========================================
 with st.sidebar:
     st.header("App Offline para Celular")
     df_dados_sidebar = st.session_state.dados_planilha
@@ -758,122 +765,36 @@ with st.sidebar:
 
     st.header("Modo de Operação")
     modo_offline_manual = st.toggle(
-        "Trabalhar Offline (Local)",
+        "Trabalhar Offline (Sessão)",
         value=st.session_state.get("forcar_offline", False),
-        help="Ative em áreas sem internet para salvar localmente e sincronizar depois."
+        help="Mantém os dados em memória durante a sessão e sincroniza quando voltar à rede."
     )
     if modo_offline_manual != st.session_state.get("forcar_offline", False):
         st.session_state.forcar_offline = modo_offline_manual
-        df_b, oc_l, status_inicial = carregar_dados()
+        df_b, oc_l, status_inicial = carregar_dados_memoria()
         st.session_state.dados_planilha = df_b
         st.session_state.lista_ocorrencias = oc_l
         st.session_state.status_base = status_inicial
         st.rerun()
 
     st.header("Base de dados")
-    if usar_google_sheets() and st.button("Atualizar base da planilha"):
+    if not st.session_state.get("forcar_offline", False) and st.button("Atualizar dados da planilha"):
         buscar_dados_online.clear()
-        try:
-            df_atualizado, oc_atualizado = buscar_dados_online()
-            df_atualizado.to_csv(BASE_PRESTADORES_PATH, index=False, encoding="utf-8-sig")
-            pd.DataFrame({"Ocorrência": oc_atualizado}).to_csv(OCORRENCIAS_LOCAIS_PATH, index=False, encoding="utf-8-sig")
-        except Exception as erro:
-            st.error(f"Não foi possível atualizar a base: {erro}")
-        else:
-            st.session_state.dados_planilha = df_atualizado
-            st.session_state.lista_ocorrencias = oc_atualizado
-            st.session_state.status_base = "Online (Google Sheets; cópia local atualizada)"
-            st.rerun()
+        df_atualizado, oc_atualizado, status_atualizado = carregar_dados_memoria()
+        st.session_state.dados_planilha = df_atualizado
+        st.session_state.lista_ocorrencias = oc_atualizado
+        st.session_state.status_base = status_atualizado
+        st.rerun()
 
-    df_dados = st.session_state.dados_planilha
-    status_conexao = st.session_state.status_base
-    csv_para_baixar = df_dados.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "Baixar base CSV para backup",
-        data=csv_para_baixar,
-        file_name="base_prestadores.csv",
-        mime="text/csv",
-        disabled=df_dados.empty,
-        use_container_width=True,
-    )
-
-def carregar_historico_local():
-    if not DADOS_LOCAIS_PATH.exists():
-        return []
-    try:
-        return pd.read_csv(DADOS_LOCAIS_PATH, dtype=str).fillna("").to_dict("records")
-    except Exception as e:
-        st.error(f"Não foi possível carregar o histórico local: {e}")
-        return []
-
-def salvar_historico_local(historico):
-    pd.DataFrame(historico, columns=COLUNAS_HISTORICO).to_csv(
-        DADOS_LOCAIS_PATH, index=False, encoding="utf-8-sig"
-    )
-
-def carregar_historico():
-    if usar_google_sheets():
-        try:
-            linhas = obter_aba_relatorios().get_all_values()
-            historico = [
-                dict(zip(COLUNAS_HISTORICO, linha))
-                for linha in linhas[1:]
-                if linha
-            ]
-            ids_remotos = {item.get("id") for item in historico}
-            historico.extend(
-                item
-                for item in carregar_historico_local()
-                if item.get("id") and item.get("id") not in ids_remotos
-            )
-            try:
-                salvar_historico_local(historico)
-            except OSError:
-                pass
-            return historico
-        except Exception as erro:
-            st.warning(
-                "Não foi possível acessar os relatos no Google Sheets. "
-                f"Usando o histórico local: {erro}"
-            )
-
-    return carregar_historico_local()
-
-def sincronizar_historico_local():
-    worksheet = obter_aba_relatorios()
-    historico_local = carregar_historico_local()
-    linhas_remotas = worksheet.get_all_values()
-    indice_id = COLUNAS_HISTORICO.index("id")
-    ids_remotos = {
-        linha[indice_id]
-        for linha in linhas_remotas[1:]
-        if len(linha) > indice_id and linha[indice_id]
-    }
-    pendentes = [
-        item for item in historico_local
-        if item.get("id") and item["id"] not in ids_remotos
-    ]
-    if pendentes:
-        ano_atual = datetime.now().year
-        for item in pendentes:
-            num_atual = str(item.get("numero_relato", ""))
-            if not num_atual or num_atual.startswith("OFF-"):
-                num_oficial = calcular_proximo_numero(worksheet, ano_atual)
-                item["numero_relato"] = num_oficial
-            linha_formatada = [item.get(coluna, "") for coluna in COLUNAS_HISTORICO]
-            worksheet.append_row(linha_formatada, value_input_option="RAW")
-        salvar_historico_local(historico_local)
-    return len(pendentes)
-
-if "historico_ocorrencias" not in st.session_state:
-    st.session_state.historico_ocorrencias = carregar_historico()
+df_dados = st.session_state.dados_planilha
+status_conexao = st.session_state.status_base
 
 # ==========================================
-# INTERFACE DO USUÁRIO
+# INTERFACE PRINCIPAL
 # ==========================================
 st.title("📋 Relato de Ocorrência")
 st.caption(f"Status da Base de Dados: **{status_conexao}**")
-if status_conexao.startswith("Offline"):
+if not status_conexao.startswith("Online"):
     st.info(status_conexao)
 
 aba_novo, aba_historico = st.tabs(["✍️ Novo Relato", "🔍 Histórico / Consultas"])
@@ -1117,45 +1038,28 @@ with aba_novo:
                 "empresa": campo_empresa,
                 "status": "Registrado",
             }
-            try:
-                if usar_google_sheets():
-                    try:
-                        ws = obter_aba_relatorios()
-                        numero_gerado = calcular_proximo_numero(ws, ano_oc)
-                        nova_oc["numero_relato"] = numero_gerado
-                        ws.append_row(
-                            [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
-                            value_input_option="RAW",
-                        )
-                    except Exception as erro_online:
-                        historico_local = carregar_historico_local()
-                        historico_local.append(nova_oc)
-                        salvar_historico_local(historico_local)
-                        st.session_state.historico_ocorrencias.append(nova_oc)
-                        st.session_state.ultimo_numero_gerado = numero_gerado
-                        st.warning(
-                            f"Google Sheets indisponível. Salvo localmente com protocolo provisório {numero_gerado}: {erro_online}"
-                        )
-                    else:
-                        historico_local = carregar_historico_local()
-                        if not any(item.get("id") == nova_oc["id"] for item in historico_local):
-                            historico_local.append(nova_oc)
-                            try:
-                                salvar_historico_local(historico_local)
-                            except OSError:
-                                pass
-                        st.session_state.historico_ocorrencias.append(nova_oc)
-                        st.session_state.ultimo_numero_gerado = numero_gerado
-                        st.success(f"Ocorrência salva com sucesso! Protocolo: **{numero_gerado}**")
-                else:
-                    historico_atualizado = carregar_historico_local()
-                    historico_atualizado.append(nova_oc)
-                    salvar_historico_local(historico_atualizado)
+            if not st.session_state.get("forcar_offline", False):
+                try:
+                    ws = obter_aba_relatorios()
+                    numero_gerado = calcular_proximo_numero(ws, ano_oc)
+                    nova_oc["numero_relato"] = numero_gerado
+                    ws.append_row(
+                        [nova_oc.get(coluna, "") for coluna in COLUNAS_HISTORICO],
+                        value_input_option="RAW",
+                    )
                     st.session_state.historico_ocorrencias.append(nova_oc)
                     st.session_state.ultimo_numero_gerado = numero_gerado
-                    st.success(f"Ocorrência salva localmente (Offline). Protocolo: **{numero_gerado}**")
-            except Exception as e:
-                st.error(f"Não foi possível salvar a ocorrência: {e}")
+                    st.success(f"Ocorrência salva no Google Sheets! Protocolo: **{numero_gerado}**")
+                except Exception as erro_online:
+                    st.session_state.historico_ocorrencias.append(nova_oc)
+                    st.session_state.ultimo_numero_gerado = numero_gerado
+                    st.warning(
+                        f"Google Sheets indisponível. Mantido na memória com protocolo {numero_gerado}: {erro_online}"
+                    )
+            else:
+                st.session_state.historico_ocorrencias.append(nova_oc)
+                st.session_state.ultimo_numero_gerado = numero_gerado
+                st.success(f"Ocorrência mantida na sessão offline. Protocolo: **{numero_gerado}**")
 
     with col_btn2:
         numero_para_pdf = st.session_state.get("ultimo_numero_gerado", f"Nº 0000/{campo_data.year}")
@@ -1170,14 +1074,14 @@ with aba_novo:
 
 with aba_historico:
     st.subheader("Consultar Ocorrências Salvas")
-    if usar_google_sheets() and st.button("Sincronizar relatos salvos offline"):
+    if not st.session_state.get("forcar_offline", False) and st.button("Sincronizar pendentes da sessão"):
         try:
-            quantidade = sincronizar_historico_local()
+            quantidade = sincronizar_pendentes_sessao()
         except Exception as erro:
-            st.error(f"Não foi possível sincronizar os relatos locais: {erro}")
+            st.error(f"Não foi possível sincronizar: {erro}")
         else:
             st.success(f"Sincronização concluída: {quantidade} relato(s) enviado(s).")
-            st.session_state.pop("historico_ocorrencias", None)
+            st.session_state.historico_ocorrencias = carregar_historico_memoria()
             st.rerun()
 
     data_filtro = st.date_input("Filtrar por data:", date.today())
@@ -1190,4 +1094,4 @@ with aba_historico:
         if df_hist.empty:
             st.info("Nenhuma ocorrência encontrada para esta data.")
     else:
-        st.info("Nenhuma ocorrência salva neste arquivo local.")
+        st.info("Nenhuma ocorrência registrada.")
