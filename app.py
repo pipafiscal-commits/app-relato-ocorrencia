@@ -637,9 +637,21 @@ def gerar_app_offline_html(df_base: pd.DataFrame, ocorrencias: list[str]) -> str
 
     function imprimirRelato() {{
       const imgPrint = document.getElementById("assinatura_print_img");
-      imgPrint.src = canvas.toDataURL("image/png");
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = canvas.width;
+      tempCanvas.height = canvas.height;
+      const tempCtx = tempCanvas.getContext("2d");
+      tempCtx.fillStyle = "#ffffff";
+      tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+      tempCtx.drawImage(canvas, 0, 0);
+
+      imgPrint.onload = function () {{
+        setTimeout(() => {{
+          window.print();
+        }}, 150);
+      }};
+      imgPrint.src = tempCanvas.toDataURL("image/png");
       imgPrint.style.display = "block";
-      window.print();
     }}
 
     function renderizarFotos(files) {{
@@ -1001,18 +1013,31 @@ with aba_novo:
         try:
             if canvas_result is not None and getattr(canvas_result, "image_data", None) is not None:
                 arr = canvas_result.image_data
-                if arr is not None and arr.sum() > 0:
-                    img_assinatura_pil = Image.fromarray(arr.astype('uint8'), mode="RGBA")
-                    pad_buffer = io.BytesIO()
-                    img_assinatura_pil.convert("RGB").save(pad_buffer, format="PNG")
-                    pad_buffer.seek(0)
-                    img_assinatura = RLImage(pad_buffer, width=160, height=70)
+                if arr is not None and arr.size > 0:
+                    img_rgba = Image.fromarray(arr.astype("uint8"), mode="RGBA")
+                    extrema = img_rgba.convert("RGB").getextrema()
+                    tem_traco = any(canal[0] < 250 for canal in extrema)
+                    if tem_traco:
+                        fundo_branco = Image.new("RGB", img_rgba.size, (255, 255, 255))
+                        fundo_branco.paste(img_rgba, mask=img_rgba.split()[3])
+                        fundo_branco.thumbnail((320, 140))
+                        pad_buffer = io.BytesIO()
+                        fundo_branco.save(pad_buffer, format="PNG")
+                        pad_buffer.seek(0)
+                        img_assinatura = RLImage(pad_buffer, width=160, height=70)
             elif assinatura_anexada is not None:
                 assinatura_anexada.seek(0)
                 img_ass = ImageOps.exif_transpose(Image.open(assinatura_anexada))
+                if img_ass.mode in ("RGBA", "LA", "P"):
+                    rgba = img_ass.convert("RGBA")
+                    fundo_branco = Image.new("RGB", rgba.size, (255, 255, 255))
+                    fundo_branco.paste(rgba, mask=rgba.split()[3])
+                    img_ass = fundo_branco
+                else:
+                    img_ass = img_ass.convert("RGB")
                 img_ass.thumbnail((320, 140))
                 pad_buffer = io.BytesIO()
-                img_ass.convert("RGB").save(pad_buffer, format="PNG")
+                img_ass.save(pad_buffer, format="PNG")
                 pad_buffer.seek(0)
                 img_assinatura = RLImage(pad_buffer, width=160, height=70)
         except Exception:
